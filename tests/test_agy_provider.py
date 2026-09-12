@@ -97,6 +97,33 @@ def test_client_forwards_hermes_tool_schema_and_returns_tool_call(monkeypatch, t
     assert "Do not use AGY tools" in prompt
 
 
+def test_client_retries_denied_agy_action_as_hermes_tool_call(monkeypatch, tmp_path):
+    module = _load_plugin(monkeypatch)
+    executable = tmp_path / "agy"
+    state_file = tmp_path / "calls"
+    executable.write_text(
+        "#!/bin/sh\n"
+        f"n=$(cat {state_file} 2>/dev/null || printf 0); n=$((n + 1)); printf '%s' \"$n\" > {state_file}\n"
+        "if [ \"$n\" = 1 ]; then\n"
+        "  printf '%s\\n' '{\"event\":\"result\",\"result\":{\"response\":\"\",\"denied_actions\":[{\"action\":\"read_file\"}]}}'\n"
+        "else\n"
+        "  printf '%s\\n' '{\"event\":\"result\",\"result\":{\"response\":\"<tool_call>{\\\"id\\\":\\\"retry_1\\\",\\\"function\\\":{\\\"name\\\":\\\"read_file\\\",\\\"arguments\\\":\\\"{\\\\\\\"path\\\\\\\":\\\\\\\"README.md\\\\\\\"}\\\"}}</tool_call>\"}}'\n"
+        "fi\n"
+    )
+    executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+
+    response = module.AGYClient(command=str(executable)).chat.completions.create(
+        messages=[{"role": "user", "content": "Read the documentation."}],
+        tools=[{"type": "function", "function": {
+            "name": "read_file", "description": "Read a text file", "parameters": {"type": "object"},
+        }}],
+    )
+
+    assert state_file.read_text() == "2"
+    assert response.choices[0].finish_reason == "tool_calls"
+    assert response.choices[0].message.tool_calls[0].id == "retry_1"
+
+
 def test_write_mode_requires_a_git_worktree(monkeypatch, tmp_path):
     module = _load_plugin(monkeypatch)
 

@@ -114,37 +114,46 @@ class AGYClient:
         ]
         if not self.write:
             argv.append("--sandbox")
-        argv += ["--output-format", "stream-json", "--print", prompt]
-        completed = subprocess.run(
-            argv,
-            cwd=self.cwd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=self.timeout,
-        )
-        if completed.returncode:
-            raise RuntimeError(f"AGY exited with status {completed.returncode}: {completed.stderr[-1000:]}")
-
-        text_parts: list[str] = []
+        text = ""
         denied_actions: list[str] = []
-        for line in completed.stdout.splitlines():
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if text := _extract_text(payload):
-                text_parts.append(text)
-            result = payload.get("result")
-            if isinstance(result, dict):
-                denied_actions.extend(
-                    str(action["action"])
-                    for action in result.get("denied_actions", []) or []
-                    if isinstance(action, dict) and action.get("action")
-                )
+        for attempt in range(2):
+            completed = subprocess.run(
+                [*argv, "--output-format", "stream-json", "--print", prompt],
+                cwd=self.cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.timeout,
+            )
+            if completed.returncode:
+                raise RuntimeError(f"AGY exited with status {completed.returncode}: {completed.stderr[-1000:]}")
 
-        text = "".join(text_parts)
+            text_parts: list[str] = []
+            denied_actions = []
+            for line in completed.stdout.splitlines():
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if response_text := _extract_text(payload):
+                    text_parts.append(response_text)
+                result = payload.get("result")
+                if isinstance(result, dict):
+                    denied_actions.extend(
+                        str(action["action"])
+                        for action in result.get("denied_actions", []) or []
+                        if isinstance(action, dict) and action.get("action")
+                    )
+            text = "".join(text_parts)
+            if not denied_actions or attempt:
+                break
+            actions = ", ".join(sorted(set(denied_actions)))
+            prompt += (
+                "\n\nYOUR AGY ACTION WAS BLOCKED: " + actions + ". Do not attempt AGY tools again. "
+                "To continue, emit exactly one Hermes <tool_call> using one of the supplied schemas."
+            )
+
         if not text and denied_actions:
             raise RuntimeError(
                 "AGY attempted denied action(s): " + ", ".join(sorted(set(denied_actions))) + "; triggering fallback"
