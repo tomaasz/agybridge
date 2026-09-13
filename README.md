@@ -9,10 +9,10 @@ results. AGY is a bounded text-only reasoning subprocess.
 
 The provider always starts AGY with `--mode plan --sandbox` and disables slash
 commands. It passes no shell command string: every option is an argv element.
-The child receives a small environment allowlist; AGY-, Gemini-, and Google-
-prefixed variables remain available for AGY's own authentication. Other
-environment variables can be passed explicitly with
-`HERMES_AGY_ENV_ALLOWLIST=NAME1,NAME2`.
+The child receives a small operating-system environment allowlist. Credential
+variables, including `GOOGLE_*`, `GEMINI_*`, and `AGY_*`, are not forwarded
+automatically. If an AGY installation needs a particular variable, pass its
+name explicitly with `HERMES_AGY_ENV_ALLOWLIST=NAME1,NAME2`.
 
 AGY cannot execute Hermes tools directly. Tool schemas are rendered into a
 delimited prompt by Hermes' public ACP bridge. The response is accepted only
@@ -73,18 +73,20 @@ Select a profile in a new session:
 /model gemini-3.8-flash-low --provider agy-fast
 ```
 
-For a wrapper executable, set `HERMES_AGY_COMMAND` or `AGY_CLI_PATH`. Positional
-wrapper arguments may be set with `HERMES_AGY_ARGS`; the plugin rejects option
-arguments so a wrapper cannot override the sandbox, mode, output format, or
-prompt flags owned by Hermes.
+For a wrapper executable, set `HERMES_AGY_COMMAND` or `AGY_CLI_PATH`. The
+wrapper must be directly executable and contain any fixed arguments itself.
+Additional process arguments are rejected because even a positional argument
+could select an AGY subcommand before the sandbox and plan-mode flags.
 
 ## Request flow and fallback
 
 The provider starts one AGY process per Hermes completion. It accepts exactly
 one `event=result` object in `stream-json`; malformed lines, missing or
 multiple result events, empty responses, non-zero exits, output over 8 MiB,
-and timeouts are errors. A timeout sends SIGTERM, waits briefly, then sends
-SIGKILL if needed. Stderr is bounded and secrets in diagnostics are redacted.
+invalid UTF-8, and timeouts are errors. The request timeout covers the initial
+attempt and the optional denial retry together. A timeout sends SIGTERM, waits
+briefly, then sends SIGKILL if needed. Closing the client stops every active
+child. Stderr is bounded and secrets in diagnostics are redacted.
 
 `stream=True` returns the standard two-chunk OpenAI-compatible shape used by
 Hermes: a data chunk followed by a usage chunk. Usage is mapped from either
@@ -103,6 +105,8 @@ The suite uses a real subprocess stub, never a live model:
 python -m pytest -q -o 'addopts=' tests/test_agy_provider.py
 python -m py_compile plugins/model-providers/agy/__init__.py \
   plugins/model-providers/agy/client.py
+ruff check plugins tests
+ruff format --check plugins tests
 git diff --check
 ```
 
@@ -112,7 +116,8 @@ JSON, missing or duplicate IDs, unknown tools, argument and prompt limits,
 `tool_choice` modes, empty/partial/multiple-result streams, split Unicode
 NDJSON, usage, process failures, redaction, timeout cleanup, denied retries,
 environment isolation, shell-injection resistance, and prompt-injection
-attempts in tool results.
+attempts in tool results. They also verify a shared retry deadline, invalid
+UTF-8 rejection, and cleanup of concurrent subprocesses.
 
 ## Troubleshooting
 

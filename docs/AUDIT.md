@@ -15,13 +15,18 @@ Audit date: 2026-09-13. Baseline: `c6fbf94` (`fix: retry denied AGY actions thro
 | AGY-07 | Empty, partial, invalid and repeated results looked successful | High | Omit/duplicate/mangle result event | Malformed lines silently skipped | Exactly one valid result required | `test_empty_partial_invalid_and_multiple_results_fail` |
 | AGY-08 | Timeout had no controlled process-tree cleanup | Medium | Hung child | No explicit termination policy | New process group, SIGTERM then SIGKILL | `test_process_error_redaction_timeout_and_command_safety` |
 | AGY-09 | Fast profile used high model when model omitted | Medium | Fast profile default request | One hard-coded default | Profile-specific default | `test_fast_profile_uses_fast_default_model` |
-| AGY-10 | Usage was always zero | Medium | Result contains token counts | Fields discarded | Map AGY/OpenAI usage names | `test_partial_ndjson_stream_true_usage_and_stream` |
-| AGY-11 | Arbitrary args could override safety flags | Medium | `--dangerously-skip-permissions` | User args concatenated | Positional wrapper args only | `test_process_args_cannot_override_security_flags` |
+| AGY-10 | Usage was always zero | Medium | Result contains token counts | Fields discarded | Map AGY/OpenAI usage names | `test_partial_ndjson_stream_true_usage_and_unicode` |
+| AGY-11 | Arbitrary args could override safety flags | Medium | `--dangerously-skip-permissions` | User args concatenated | Reject extra process arguments | `test_process_args_cannot_override_security_mode` |
 | AGY-12 | README claimed a private/nonexistent API | High | Public installation | Wrong bridge contract | Public hook, bridge import, version gate | public Hermes smoke test |
+| AGY-13 | Unrelated Google/Gemini credentials were forwarded automatically | High | Set `GOOGLE_API_KEY` in the parent | Prefix-based environment allowlist | Credential variables require explicit opt-in | `test_child_environment_is_restricted` |
+| AGY-14 | A denied-action retry could consume twice the request timeout | Medium | Slow first and second attempts | Timeout reset per subprocess | One deadline shared by both attempts | `test_denied_retry_shares_the_request_deadline` |
+| AGY-15 | `close()` stopped only the last concurrent child | Medium | Start two completions, then close | One active-process slot | Track and stop every active process | `test_close_stops_all_concurrent_children_and_prevents_reuse` |
+| AGY-16 | Invalid UTF-8 was silently replaced | Medium | Emit malformed bytes before NDJSON parsing | Decoder used replacement characters | Reject invalid UTF-8 before parsing | `test_empty_partial_invalid_and_multiple_results_fail` |
+| AGY-17 | A positional argument could select an AGY subcommand before safety flags | High | Configure `args=["mcp"]` | Only dash-prefixed arguments were rejected | Require a directly executable wrapper and reject all extra arguments | `test_process_args_cannot_override_security_mode` |
 
 ## Verification and dependency audit
 
-The baseline suite had 4 tests and passed despite these defects. The final suite has 23 behavioral tests using real subprocess stubs, split NDJSON writes, hangs, non-zero exits, large Unicode responses and denial retries. CI never logs in to Gemini. The plugin has no runtime dependencies beyond Python's standard library and Hermes' public API; pytest is test-only. No secrets, tokens, cookies, private hosts or user data are stored. Child environment and stderr diagnostics are bounded and filtered.
+The baseline suite had 4 tests and passed despite these defects. The final suite has 25 behavioral tests using real subprocess stubs, split NDJSON writes, hangs, non-zero exits, invalid UTF-8, large Unicode responses, concurrent shutdown and denial retries. CI never logs in to Gemini. The plugin has no runtime dependencies beyond Python's standard library and Hermes' public API; pytest is test-only. No secrets, tokens, cookies, private hosts or user data are stored. Child environment and stderr diagnostics are bounded and filtered.
 
 ## Performance decisions
 
