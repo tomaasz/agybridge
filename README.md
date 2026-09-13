@@ -1,30 +1,59 @@
-# hermes-agy-plugin
+# Hermes AGY provider plugin
 
-A secure external-process model-provider plugin that connects [Hermes Agent](https://github.com/NousResearch/hermes-agent) to the AGY CLI.
+This repository adds two Hermes Agent model-provider profiles for the AGY CLI:
+**AGY** (high effort) and **AGY Fast** (low effort). Hermes remains the owner of
+the conversation state, tool schemas, approvals, execution, logs, and tool
+results. AGY is a bounded text-only reasoning subprocess.
 
-It provides two Hermes model-provider profiles:
+## Security model
 
-- **AGY** — high-effort reasoning profile;
-- **AGY Fast** — low-effort reasoning profile.
+The provider always starts AGY with `--mode plan --sandbox` and disables slash
+commands. It passes no shell command string: every option is an argv element.
+The child receives a small environment allowlist; AGY-, Gemini-, and Google-
+prefixed variables remain available for AGY's own authentication. Other
+environment variables can be passed explicitly with
+`HERMES_AGY_ENV_ALLOWLIST=NAME1,NAME2`.
 
-## Why this plugin
+AGY cannot execute Hermes tools directly. Tool schemas are rendered into a
+delimited prompt by Hermes' public ACP bridge. The response is accepted only
+after the plugin validates the NDJSON envelope, tool name, call ID, exact JSON
+shape, argument object, size, duplicates, and `tool_choice`. A blocked AGY
+action gets one bounded retry with a generic instruction; a second denial
+fails closed and lets Hermes' normal fallback handle it.
 
-AGY remains an external CLI with its own authentication. Hermes remains the coordinator for tool availability, approvals, command safety, logging, and session state.
+Write mode is deliberately rejected, including inside a Git worktree. Allowing
+AGY's own edit tools would bypass Hermes approval gates and violate the host
+ownership model. Writes must be requested as Hermes tool calls.
 
-When a task needs a tool, AGY emits an OpenAI-shaped `tool_call` block. The plugin converts it to a standard Hermes tool call; Hermes then validates and executes it through its normal dispatcher. AGY does **not** receive independent terminal, filesystem, browser, network, or permission access.
+```mermaid
+flowchart LR
+    H[Hermes Agent] -->|messages + tool schemas| P[AGY provider]
+    P -->|argv: plan + sandbox| A[AGY CLI]
+    A -->|stream-json response| P
+    P -->|validated OpenAI-shaped response| H
+    H --> T[Hermes dispatcher]
+    T -->|approval, execution, result| H
+    H -->|tool result as untrusted data| P
+```
 
-## Requirements
+## Requirements and compatibility
 
-- Hermes Agent with external-process model-provider support and `agent.acp_openai_bridge`;
-- AGY CLI installed and authenticated according to its upstream documentation;
-- Python 3.11+.
+- Hermes Agent **0.21.2 or newer**, including `ProviderProfile.create_client`
+  and `agent.acp_openai_bridge`;
+- AGY CLI installed and authenticated using its upstream instructions;
+- Python 3.11 or newer.
 
-The default profiles request these model IDs. Override them in the plugin if your AGY installation exposes different names:
+The implementation was exercised against the public Hermes 0.21.2 source and
+AGY CLI 1.2.2's documented command-line interface (`agy --version` and
+`agy --help`). CI never logs in to Gemini and never requires a live AGY call.
 
-- `gemini-3.8-flash-high` for **AGY**;
-- `gemini-3.8-flash-low` for **AGY Fast**.
+The model defaults are `gemini-3.8-flash-high` and
+`gemini-3.8-flash-low`. They are passed through unchanged, so an AGY release
+with different model aliases can select those names explicitly in Hermes.
 
-## Install
+## Installation
+
+From a checkout:
 
 ```bash
 git clone https://github.com/tomaasz/hermes-agy-plugin.git
@@ -33,7 +62,9 @@ cp -R hermes-agy-plugin/plugins/model-providers/agy \
   ~/.hermes/plugins/model-providers/agy
 ```
 
-Restart the Hermes gateway or start a new Hermes process after installation.
+Hermes' plugin installer can also install the repository into its normal
+`$HERMES_HOME/plugins/` directory. Restart Hermes or start a new session after
+installing so provider discovery runs again.
 
 Select a profile in a new session:
 
@@ -42,31 +73,75 @@ Select a profile in a new session:
 /model gemini-3.8-flash-low --provider agy-fast
 ```
 
-## Security model
+For a wrapper executable, set `HERMES_AGY_COMMAND` or `AGY_CLI_PATH`. Positional
+wrapper arguments may be set with `HERMES_AGY_ARGS`; the plugin rejects option
+arguments so a wrapper cannot override the sandbox, mode, output format, or
+prompt flags owned by Hermes.
 
-| Capability | Owner |
-|---|---|
-| AGY authentication | AGY CLI |
-| Model reasoning | AGY CLI |
-| Tool schema and tool dispatch | Hermes |
-| Command approvals and policy | Hermes |
-| Execution, logging, and tool results | Hermes |
+## Request flow and fallback
 
-The provider defaults to `--mode plan --sandbox`. Write mode is supported only by an explicit client construction and rejects paths that are not isolated Git worktrees. The public profiles do not enable write mode.
+The provider starts one AGY process per Hermes completion. It accepts exactly
+one `event=result` object in `stream-json`; malformed lines, missing or
+multiple result events, empty responses, non-zero exits, output over 8 MiB,
+and timeouts are errors. A timeout sends SIGTERM, waits briefly, then sends
+SIGKILL if needed. Stderr is bounded and secrets in diagnostics are redacted.
 
-## Development
+`stream=True` returns the standard two-chunk OpenAI-compatible shape used by
+Hermes: a data chunk followed by a usage chunk. Usage is mapped from either
+`prompt_tokens`/`completion_tokens` or `input_tokens`/`output_tokens` when AGY
+provides it.
 
-Run the contract tests without a live AGY installation:
+If AGY returns a denied internal action, the plugin retries once. The retry
+does not echo the action name or any AGY output. A second denial raises a
+provider error, allowing Hermes' configured provider fallback to take over.
+
+## Development and tests
+
+The suite uses a real subprocess stub, never a live model:
 
 ```bash
 python -m pytest -q -o 'addopts=' tests/test_agy_provider.py
+python -m py_compile plugins/model-providers/agy/__init__.py \
+  plugins/model-providers/agy/client.py
+git diff --check
 ```
 
-The suite verifies that the plugin exposes both profiles, forwards Hermes tool schemas, returns standard tool calls, and rejects write mode outside an isolated worktree.
+Tests cover both profiles, model/effort forwarding, read-only flags, write
+rejection, schema forwarding, valid and multiple calls, malformed wrappers and
+JSON, missing or duplicate IDs, unknown tools, argument and prompt limits,
+`tool_choice` modes, empty/partial/multiple-result streams, split Unicode
+NDJSON, usage, process failures, redaction, timeout cleanup, denied retries,
+environment isolation, shell-injection resistance, and prompt-injection
+attempts in tool results.
 
-## Compatibility
+## Troubleshooting
 
-This plugin uses Hermes' public ACP text bridge (`agent.acp_openai_bridge`). It intentionally does not patch Hermes core files. Compatibility is tested against Hermes Agent `0.21.2`; earlier releases may not provide the bridge.
+- **Provider is missing:** verify Hermes is 0.21.2+ and that the directory is
+  under `$HERMES_HOME/plugins/model-providers/agy`; restart the session.
+- **CLI not found:** run `agy --version`, then set `AGY_CLI_PATH` to the
+  executable selected by your installation.
+- **Authentication failure:** authenticate AGY with its upstream CLI. Hermes
+  does not read or store AGY credentials.
+- **Timeout or output-limit error:** use a smaller request or configure the
+  provider timeout in Hermes; inspect the AGY CLI independently with a simple
+  non-interactive prompt.
+- **Tool call rejected:** the call must use exactly
+  `<tool_call>{"id":"...","type":"function","function":{"name":"...","arguments":"{...}"}}</tool_call>`
+  and the name must be one of the Hermes schemas in that turn.
+
+## Limitations
+
+AGY is text-only in this adapter; image content is represented by a placeholder.
+There is no live model catalog, parallel subprocess mode, telemetry, or
+automatic credential forwarding. The adapter does not modify Hermes core and
+does not grant AGY a terminal, filesystem, browser, network, or independent
+tool executor.
+
+## Reporting problems
+
+Please include the Hermes version, AGY version, selected profile, sanitized
+error text, and a minimal reproducible stream-json fixture. Never include
+tokens, cookies, credentials, private paths, or full tool-result contents.
 
 ## License
 
