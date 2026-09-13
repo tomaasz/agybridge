@@ -62,7 +62,6 @@ _COMMON_PROFILE = {
     "process_command": "agy",
     "process_args": (),
     "process_command_env_vars": ("HERMES_AGY_COMMAND", "AGY_CLI_PATH"),
-    "process_args_env_var": "HERMES_AGY_ARGS",
     "supports_health_check": False,
 }
 

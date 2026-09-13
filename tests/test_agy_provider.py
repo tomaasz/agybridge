@@ -5,6 +5,8 @@ import json
 import stat
 import sys
 import textwrap
+import threading
+import time
 import types
 from itertools import count
 from pathlib import Path
@@ -153,8 +155,7 @@ def _write_stub(
 
 def _client(module, tmp_path, stub, **kwargs):
     return module.AGYClient(
-        command=sys.executable,
-        args=[str(stub)],
+        command=str(stub),
         cwd=str(tmp_path),
         timeout=kwargs.pop("timeout", 2),
         terminate_grace=kwargs.pop("terminate_grace", 0.1),
@@ -232,7 +233,7 @@ def test_fast_profile_uses_fast_default_model(monkeypatch, tmp_path):
         tmp_path, events=[{"event": "result", "result": {"response": "ok"}}]
     )
     result = module.agy_fast.create_client(
-        command=sys.executable, args=[str(stub)], cwd=str(tmp_path)
+        command=str(stub), cwd=str(tmp_path)
     ).chat.completions.create(messages=[])
     assert result.model == module.FAST_MODEL
 
@@ -244,12 +245,11 @@ def test_write_mode_is_rejected_even_for_git_directory(monkeypatch, tmp_path):
         module.AGYClient(cwd=str(tmp_path), write=True)
 
 
-def test_process_args_cannot_override_security_flags(monkeypatch, tmp_path):
+def test_process_args_cannot_override_security_mode(monkeypatch, tmp_path):
     module = _load_plugin(monkeypatch)
-    with pytest.raises(ValueError, match="plugin owns every AGY option"):
-        module.AGYClient(
-            command="agy", args=["--dangerously-skip-permissions"], cwd=str(tmp_path)
-        )
+    for args in (["--dangerously-skip-permissions"], ["mcp"]):
+        with pytest.raises(ValueError, match="process args are disabled"):
+            module.AGYClient(command="agy", args=args, cwd=str(tmp_path))
 
 
 def test_valid_tool_call_and_text_before_after(monkeypatch, tmp_path):
@@ -404,6 +404,14 @@ def test_empty_partial_invalid_and_multiple_results_fail(monkeypatch, tmp_path):
     invalid.write_text(f"#!{sys.executable}\nprint('not-json')\n", encoding="utf-8")
     with pytest.raises(module.AGYProtocolError, match="invalid stream-json"):
         _client(module, tmp_path, invalid).chat.completions.create(messages=[])
+    invalid_utf8 = tmp_path / "invalid-utf8.py"
+    invalid_utf8.write_text(
+        f"#!{sys.executable}\nimport sys\nsys.stdout.buffer.write(bytes([255, 10]))\n",
+        encoding="utf-8",
+    )
+    invalid_utf8.chmod(invalid_utf8.stat().st_mode | stat.S_IXUSR)
+    with pytest.raises(module.AGYProtocolError, match="valid UTF-8"):
+        _client(module, tmp_path, invalid_utf8).chat.completions.create(messages=[])
 
 
 def test_unclosed_tool_wrapper_and_stdout_limit_fail(monkeypatch, tmp_path):
@@ -505,9 +513,31 @@ def test_denied_action_then_hermes_call_retries_once(monkeypatch, tmp_path):
     )
 
 
+def test_denied_retry_shares_the_request_deadline(monkeypatch, tmp_path):
+    module = _load_plugin(monkeypatch)
+    state, script = tmp_path / "calls", tmp_path / "slow-retry.py"
+    script.write_text(
+        "#!/usr/bin/env python3\nimport json, pathlib, time\n"
+        + f"p=pathlib.Path({str(state)!r}); n=int(p.read_text())+1 if p.exists() else 1; p.write_text(str(n))\n"
+        + "time.sleep(0.3)\n"
+        + "result={'response': '' if n == 1 else 'late', 'denied_actions': [{'action':'internal'}] if n == 1 else []}\n"
+        + "print(json.dumps({'event':'result','result':result}), flush=True)\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    started = time.monotonic()
+    with pytest.raises(module.AGYTimeoutError):
+        _client(module, tmp_path, script, timeout=0.5).chat.completions.create(
+            messages=[]
+        )
+    assert state.read_text() == "2"
+    assert time.monotonic() - started < 0.75
+
+
 def test_child_environment_is_restricted(monkeypatch, tmp_path):
     module = _load_plugin(monkeypatch)
     monkeypatch.setenv("UNRELATED_PRIVATE_TOKEN", "do-not-forward")
+    monkeypatch.setenv("GOOGLE_API_KEY", "synthetic-google-secret")
     stub = _write_stub(tmp_path, events=[], env_name="UNRELATED_PRIVATE_TOKEN")
     assert (
         _client(module, tmp_path, stub)
@@ -516,6 +546,63 @@ def test_child_environment_is_restricted(monkeypatch, tmp_path):
         .message.content
         == "<absent>"
     )
+    google_stub = _write_stub(tmp_path, events=[], env_name="GOOGLE_API_KEY")
+    hidden = _client(module, tmp_path, google_stub).chat.completions.create(messages=[])
+    assert hidden.choices[0].message.content == "<absent>"
+    allowed = _client(
+        module,
+        tmp_path,
+        google_stub,
+        env_allowlist=["GOOGLE_API_KEY"],
+    ).chat.completions.create(messages=[])
+    assert allowed.choices[0].message.content == "synthetic-google-secret"
+
+
+def test_close_stops_all_concurrent_children_and_prevents_reuse(monkeypatch, tmp_path):
+    module = _load_plugin(monkeypatch)
+    started_file = tmp_path / "started"
+    script = tmp_path / "concurrent.py"
+    script.write_text(
+        "#!/usr/bin/env python3\nimport json, os, time\n"
+        + f"with open({str(started_file)!r}, 'a', encoding='utf-8') as f: f.write(str(os.getpid()) + '\\n'); f.flush()\n"
+        + "time.sleep(10)\n"
+        + "print(json.dumps({'event':'result','result':{'response':'late'}}), flush=True)\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    client = _client(module, tmp_path, script, timeout=5)
+    errors = []
+
+    def invoke() -> None:
+        try:
+            client.chat.completions.create(messages=[])
+        except module.AGYError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=invoke) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + 2
+    try:
+        while time.monotonic() < deadline:
+            if (
+                started_file.exists()
+                and len(started_file.read_text().splitlines()) == 2
+            ):
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("both AGY subprocesses did not start")
+    finally:
+        client.close()
+    for thread in threads:
+        thread.join(timeout=2)
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(errors) == 2 and all(
+        isinstance(exc, module.AGYProcessError) for exc in errors
+    )
+    with pytest.raises(module.AGYProcessError, match="closed"):
+        client.chat.completions.create(messages=[])
 
 
 def test_tool_result_prompt_injection_cannot_authorize_unknown_tool(

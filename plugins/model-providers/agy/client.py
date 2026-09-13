@@ -75,8 +75,6 @@ _SAFE_ENV_NAMES = {
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
 }
-_AUTH_ENV_PREFIXES = ("AGY_", "GEMINI_", "GOOGLE_")
-
 TEXT_ONLY_CONTRACT = (
     "You are a text-only reasoning worker inside Hermes. AGY tools, terminal, filesystem, browser, "
     "network, permissions, and subagents are unavailable. Hermes alone validates, authorizes, and "
@@ -170,9 +168,7 @@ def _safe_child_env(extra_names: Iterable[str] = ()) -> dict[str, str]:
     return {
         name: value
         for name, value in os.environ.items()
-        if name in _SAFE_ENV_NAMES
-        or name in requested
-        or name.startswith(_AUTH_ENV_PREFIXES)
+        if name in _SAFE_ENV_NAMES or name in requested
     }
 
 
@@ -306,7 +302,10 @@ def _extract_usage(result: Mapping[str, Any]) -> dict[str, int]:
 
 
 def _parse_stream_json(stdout: bytes) -> _ParsedOutput:
-    decoded = stdout.decode("utf-8", errors="replace")
+    try:
+        decoded = stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AGYProtocolError("AGY stdout is not valid UTF-8 stream-json") from exc
     lines = [line for line in decoded.splitlines() if line.strip()]
     if not lines:
         raise AGYProtocolError("AGY returned empty stdout")
@@ -477,15 +476,6 @@ def _strict_tool_calls(
     return calls, clean_text
 
 
-def _validate_extra_args(args: Iterable[str]) -> list[str]:
-    normalized = [str(arg) for arg in args]
-    if any(arg.startswith("-") for arg in normalized):
-        raise ValueError(
-            "AGY process args may contain only positional wrapper arguments; the plugin owns every AGY option"
-        )
-    return normalized
-
-
 class AGYClient:
     """OpenAI-shaped client that runs one bounded AGY process per request."""
 
@@ -520,13 +510,16 @@ class AGYClient:
             )
         if not isinstance(command, str) or not command.strip():
             raise ValueError("AGY command must be a non-empty executable name")
+        if args:
+            raise ValueError(
+                "AGY process args are disabled because they can select a subcommand before the sandbox flags; use a wrapper executable instead"
+            )
         workdir = Path(acp_cwd or cwd or os.getcwd()).expanduser().resolve()
         if not workdir.is_dir():
             raise ValueError("AGY cwd must be an existing directory")
         if not isinstance(default_model, str) or not default_model.strip():
             raise ValueError("AGY default model must be non-empty")
         self.command = command.strip()
-        self.args = _validate_extra_args(args or [])
         self.cwd = str(workdir)
         self.timeout = _positive_number(
             timeout, DEFAULT_TIMEOUT_SECONDS, label="AGY timeout"
@@ -555,16 +548,16 @@ class AGYClient:
         self._child_env = _safe_child_env([*configured_allowlist, *env_allowlist])
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
         self.is_closed = False
-        self._active_process: subprocess.Popen[bytes] | None = None
+        self._active_processes: set[subprocess.Popen[bytes]] = set()
         self._process_lock = threading.Lock()
 
     def close(self) -> None:
         """Stop an in-flight child; safe to call more than once."""
         with self._process_lock:
-            process = self._active_process
-            self._active_process = None
-        self.is_closed = True
-        if process is not None:
+            self.is_closed = True
+            processes = tuple(self._active_processes)
+            self._active_processes.clear()
+        for process in processes:
             self._stop_process(process)
 
     def _stop_process(self, process: subprocess.Popen[bytes]) -> None:
@@ -610,74 +603,82 @@ class AGYClient:
                 f"AGY executable {Path(self.command).name!r} could not be started"
             ) from exc
 
-        self.is_closed = False
         with self._process_lock:
-            self._active_process = process
-        stdout, stderr = bytearray(), bytearray()
-        overflow = threading.Event()
+            if self.is_closed:
+                closed = True
+            else:
+                self._active_processes.add(process)
+                closed = False
+        if closed:
+            self._stop_process(process)
+            raise AGYProcessError("AGY client is closed")
 
-        def drain(
-            stream: Any, target: bytearray, limit: int, *, keep_tail: bool
-        ) -> None:
-            while True:
-                chunk = stream.read(65536)
-                if not chunk:
-                    return
-                if keep_tail:
-                    target.extend(chunk)
-                    if len(target) > limit:
-                        del target[:-limit]
-                else:
-                    if len(target) + len(chunk) > limit:
-                        remaining = max(0, limit - len(target))
-                        target.extend(chunk[:remaining])
-                        overflow.set()
+        try:
+            stdout, stderr = bytearray(), bytearray()
+            overflow = threading.Event()
+
+            def drain(
+                stream: Any, target: bytearray, limit: int, *, keep_tail: bool
+            ) -> None:
+                while True:
+                    chunk = stream.read(65536)
+                    if not chunk:
                         return
-                    target.extend(chunk)
+                    if keep_tail:
+                        target.extend(chunk)
+                        if len(target) > limit:
+                            del target[:-limit]
+                    else:
+                        if len(target) + len(chunk) > limit:
+                            remaining = max(0, limit - len(target))
+                            target.extend(chunk[:remaining])
+                            overflow.set()
+                            return
+                        target.extend(chunk)
 
-        out_thread = threading.Thread(
-            target=drain,
-            args=(process.stdout, stdout, self.max_stdout_bytes),
-            kwargs={"keep_tail": False},
-            daemon=True,
-        )
-        err_thread = threading.Thread(
-            target=drain,
-            args=(process.stderr, stderr, self.max_stderr_bytes),
-            kwargs={"keep_tail": True},
-            daemon=True,
-        )
-        out_thread.start()
-        err_thread.start()
-        deadline = time.monotonic() + timeout
-        timed_out = False
-        while process.poll() is None:
+            out_thread = threading.Thread(
+                target=drain,
+                args=(process.stdout, stdout, self.max_stdout_bytes),
+                kwargs={"keep_tail": False},
+                daemon=True,
+            )
+            err_thread = threading.Thread(
+                target=drain,
+                args=(process.stderr, stderr, self.max_stderr_bytes),
+                kwargs={"keep_tail": True},
+                daemon=True,
+            )
+            out_thread.start()
+            err_thread.start()
+            deadline = time.monotonic() + timeout
+            timed_out = False
+            while process.poll() is None:
+                if overflow.is_set():
+                    self._stop_process(process)
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    self._stop_process(process)
+                    break
+                time.sleep(0.02)
+            out_thread.join(timeout=self.terminate_grace)
+            err_thread.join(timeout=self.terminate_grace)
+            if timed_out:
+                raise AGYTimeoutError(f"AGY exceeded the {timeout:g}s request timeout")
             if overflow.is_set():
-                self._stop_process(process)
-                break
-            if time.monotonic() >= deadline:
-                timed_out = True
-                self._stop_process(process)
-                break
-            time.sleep(0.02)
-        out_thread.join(timeout=self.terminate_grace)
-        err_thread.join(timeout=self.terminate_grace)
-        with self._process_lock:
-            if self._active_process is process:
-                self._active_process = None
-        if timed_out:
-            raise AGYTimeoutError(f"AGY exceeded the {timeout:g}s request timeout")
-        if overflow.is_set():
-            raise AGYProtocolError(
-                f"AGY stdout exceeded the {self.max_stdout_bytes}-byte limit"
-            )
-        if process.returncode:
-            tail = _redact(stderr.decode("utf-8", errors="replace")).strip()
-            detail = f": {tail}" if tail else ""
-            raise AGYProcessError(
-                f"AGY exited with status {process.returncode}{detail}"
-            )
-        return bytes(stdout), bytes(stderr)
+                raise AGYProtocolError(
+                    f"AGY stdout exceeded the {self.max_stdout_bytes}-byte limit"
+                )
+            if process.returncode:
+                tail = _redact(stderr.decode("utf-8", errors="replace")).strip()
+                detail = f": {tail}" if tail else ""
+                raise AGYProcessError(
+                    f"AGY exited with status {process.returncode}{detail}"
+                )
+            return bytes(stdout), bytes(stderr)
+        finally:
+            with self._process_lock:
+                self._active_processes.discard(process)
 
     def _create(
         self,
@@ -690,6 +691,9 @@ class AGYClient:
         timeout: Any = None,
         **_: Any,
     ) -> Any:
+        with self._process_lock:
+            if self.is_closed:
+                raise AGYProcessError("AGY client is closed")
         selected_model = (model or self.default_model).strip()
         if not selected_model:
             raise ValueError("AGY model must be non-empty")
@@ -715,7 +719,6 @@ class AGYClient:
             )
         argv = [
             self.command,
-            *self.args,
             "--model",
             selected_model,
             "--effort",
@@ -733,9 +736,17 @@ class AGYClient:
         ]
         parsed: _ParsedOutput | None = None
         current_prompt = prompt
+        request_deadline = time.monotonic() + effective_timeout
+        print_timeout_index = argv.index("--print-timeout") + 1
         for attempt in range(2):
+            remaining = request_deadline - time.monotonic()
+            if remaining <= 0:
+                raise AGYTimeoutError(
+                    f"AGY exceeded the {effective_timeout:g}s request timeout"
+                )
+            argv[print_timeout_index] = f"{max(1, math.ceil(remaining))}s"
             argv[-1] = current_prompt
-            stdout, _stderr = self._run_process(argv, effective_timeout)
+            stdout, _stderr = self._run_process(argv, remaining)
             parsed = _parse_stream_json(stdout)
             if not parsed.denied:
                 break
