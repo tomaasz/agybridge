@@ -13,7 +13,13 @@ except ImportError as exc:  # pragma: no cover - exercised by an import subproce
         "external-process provider API"
     ) from exc
 
-from .client import AGYClient, AGYError, AGYProcessError, AGYProtocolError, AGYTimeoutError
+from .client import (
+    AGYClient,
+    AGYError,
+    AGYProcessError,
+    AGYProtocolError,
+    AGYTimeoutError,
+)
 
 MODEL = "gemini-3.8-flash-high"
 FAST_MODEL = "gemini-3.8-flash-low"

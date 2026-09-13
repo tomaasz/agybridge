@@ -11,10 +11,11 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any
 
 try:
     from agent.acp_openai_bridge import (
