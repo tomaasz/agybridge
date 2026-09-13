@@ -27,4 +27,5 @@ jobs:
         run: |
           python -m py_compile plugins/model-providers/agy/__init__.py plugins/model-providers/agy/client.py
           ruff check plugins tests
+          ruff format --check plugins tests
           git diff --check
