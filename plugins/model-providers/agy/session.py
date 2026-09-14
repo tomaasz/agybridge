@@ -242,26 +242,33 @@ class SessionPool:
     def checkout(
         self, key: tuple[Any, ...], messages: list[dict[str, Any]]
     ) -> tuple[AGYSession | None, list[dict[str, Any]] | None, str]:
-        """Take the idle session that continues ``messages``, if any."""
+        """Take the idle session that continues ``messages``, if any.
+
+        ``key`` is ``(conversation, compatibility)``. Idle sessions of the same
+        conversation that cannot continue it are stopped, so one conversation
+        never holds more than one AGY process.
+        """
         expired = self._collect_expired()
         try:
             with self._lock:
-                same_key = False
-                for session in self._idle:
-                    if session.key != key:
-                        continue
-                    same_key = True
-                    delta = _delta(session, messages)
-                    if delta is not None:
-                        self._idle.remove(session)
-                        return session, delta, "reuse"
-                if same_key:
-                    reason = "history diverged"
-                elif self._idle:
-                    reason = "model, tools or environment changed"
+                same_conversation = [s for s in self._idle if s.key[0] == key[0]]
+                for session in same_conversation:
+                    self._idle.remove(session)
+            match: AGYSession | None = None
+            delta: list[dict[str, Any]] | None = None
+            for session in same_conversation:
+                candidate = _delta(session, messages) if session.key == key else None
+                if match is None and candidate is not None:
+                    match, delta = session, candidate
                 else:
-                    reason = "no idle session"
-                return None, None, reason
+                    expired.append(session)
+            if match is not None:
+                return match, delta, "reuse"
+            if not same_conversation:
+                return None, None, "new conversation"
+            if all(session.key != key for session in same_conversation):
+                return None, None, "model, effort, tools or environment changed"
+            return None, None, "history diverged"
         finally:
             for session in expired:
                 session.stop()
@@ -270,6 +277,9 @@ class SessionPool:
         evicted: list[AGYSession] = []
         if session.alive:
             with self._lock:
+                for other in [s for s in self._idle if s.key[0] == session.key[0]]:
+                    self._idle.remove(other)
+                    evicted.append(other)
                 self._idle.append(session)
                 limit = int(_env_number(MAX_SESSIONS_ENV, DEFAULT_MAX_SESSIONS))
                 self._idle.sort(key=lambda item: item.last_used)

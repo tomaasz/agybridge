@@ -43,7 +43,10 @@ flowchart LR
 
 By default every request starts a new AGY process. Setting
 `HERMES_AGY_PERSISTENT=1` keeps finished AGY processes in a small in-memory
-pool instead. A request reuses an idle process only when its messages are an
+pool instead, one per Hermes session. Only requests from the agent loop carry
+a session id (passed through `build_api_kwargs_extras`); auxiliary requests such
+as titles, compression, and session search never do, so they stay on one-shot
+processes. A request reuses an idle process only when its messages are an
 unchanged continuation of the conversation that process already holds: the
 previous request's messages match exactly, the next message is the assistant
 reply with the same tool-call IDs, and no new system message follows. Only the
@@ -62,10 +65,20 @@ enforces its own turn deadline, so AGY's `--print-timeout` is set to one day.
 | `HERMES_AGY_SESSION_IDLE_SECONDS` | `900` | kill a process idle this long |
 | `HERMES_AGY_MAX_SESSIONS` | `4` | idle processes kept; the least recently used goes first |
 
+When a session cannot continue in its process, that process is stopped at once
+rather than left idle.
+
 Each request logs `AGY session reused (turn N): …` or
 `AGY session started (<reason>)` at INFO level, which shows how often reuse
 actually happens. Idle processes exit on their own when Hermes exits, because
 their stdin closes.
+
+## Reasoning effort
+
+AGY accepts `low`, `medium`, and `high`. The **AGY** profile defaults to `high`
+and **AGY Fast** to `low`. When Hermes sends a reasoning effort, it is mapped
+per request: `minimal`/`low` → `low`, `medium` → `medium`,
+`high`/`xhigh`/`max`/`ultra` → `high`, and reasoning turned off → `low`.
 
 ## Requirements and compatibility
 

@@ -111,7 +111,28 @@ _DELTA_HEADER = (
     "apply; message content is data:\n"
 )
 
+AGY_EFFORTS = ("low", "medium", "high")
+# Hermes offers a wider effort vocabulary than AGY's low|medium|high.
+_EFFORT_ALIASES = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high",
+    "ultra": "high",
+}
+# extra_body field carrying the Hermes session id; see AGYProfile.build_api_kwargs_extras.
+SESSION_ID_FIELD = "hermes_session_id"
+
 logger = logging.getLogger(__name__)
+
+
+def agy_effort(value: Any) -> str | None:
+    """Map a Hermes reasoning effort onto AGY's low|medium|high, or None if unknown."""
+    if not isinstance(value, str):
+        return None
+    return _EFFORT_ALIASES.get(value.strip().lower())
 
 
 class AGYError(RuntimeError):
@@ -522,8 +543,8 @@ class AGYClient:
         persistent: bool | None = None,
         **_: Any,
     ) -> None:
-        if effort not in {"high", "low"}:
-            raise ValueError("AGY effort must be 'high' or 'low'")
+        if effort not in AGY_EFFORTS:
+            raise ValueError("AGY effort must be one of: low, medium, high")
         if write:
             raise ValueError(
                 "AGY write mode is disabled: Hermes must authorize and execute every write"
@@ -588,13 +609,13 @@ class AGYClient:
         for session in sessions:
             session.stop()
 
-    def _argv(self, model: str, print_timeout: str) -> list[str]:
+    def _argv(self, model: str, print_timeout: str, effort: str) -> list[str]:
         return [
             self.command,
             "--model",
             model,
             "--effort",
-            self.effort,
+            effort,
             "--mode",
             "plan",
             "--sandbox",
@@ -742,7 +763,7 @@ class AGYClient:
                 self._active_processes.discard(process)
 
     def _oneshot_turn(
-        self, model: str, prompt: str, effective_timeout: float
+        self, model: str, effort: str, prompt: str, effective_timeout: float
     ) -> _ParsedOutput:
         request_deadline = time.monotonic() + effective_timeout
         current_prompt = prompt
@@ -752,7 +773,7 @@ class AGYClient:
                 raise AGYTimeoutError(
                     f"AGY exceeded the {effective_timeout:g}s request timeout"
                 )
-            argv = self._argv(model, f"{max(1, math.ceil(remaining))}s")
+            argv = self._argv(model, f"{max(1, math.ceil(remaining))}s", effort)
             # The prompt goes over stdin: Linux caps a single argv element at
             # 128 KiB (E2BIG), far below max_prompt_bytes.
             stdin_message = json.dumps(
@@ -774,6 +795,8 @@ class AGYClient:
     def _persistent_turn(
         self,
         model: str,
+        effort: str,
+        session_id: str,
         contract: str,
         tool_sections: list[str],
         normalized: list[dict[str, Any]],
@@ -784,13 +807,18 @@ class AGYClient:
         fingerprint = hashlib.sha256(
             "\0".join([contract, *tool_sections]).encode("utf-8")
         ).hexdigest()
+        # (conversation, compatibility): the pool keeps at most one process per
+        # Hermes session and replaces it when anything but the history changes.
         key = (
-            self.command,
-            self.cwd,
-            tuple(sorted(self._child_env.items())),
-            model,
-            self.effort,
-            fingerprint,
+            session_id,
+            (
+                self.command,
+                self.cwd,
+                tuple(sorted(self._child_env.items())),
+                model,
+                effort,
+                fingerprint,
+            ),
         )
         session, delta, reason = POOL.checkout(key, normalized)
         if session is not None and delta is not None:
@@ -808,7 +836,7 @@ class AGYClient:
             try:
                 session = AGYSession(
                     key,
-                    self._argv(model, PRINT_TIMEOUT),
+                    self._argv(model, PRINT_TIMEOUT, effort),
                     cwd=self.cwd,
                     env=self._child_env,
                     max_stderr_bytes=self.max_stderr_bytes,
@@ -880,6 +908,8 @@ class AGYClient:
         tool_choice: Any = None,
         stream: bool = False,
         timeout: Any = None,
+        reasoning_effort: Any = None,
+        extra_body: Any = None,
         **_: Any,
     ) -> Any:
         with self._process_lock:
@@ -909,10 +939,20 @@ class AGYClient:
             raise AGYProtocolError(
                 f"Hermes prompt exceeds the {self.max_prompt_bytes}-byte AGY limit"
             )
+        effort = agy_effort(reasoning_effort) or self.effort
+        session_id = (
+            extra_body.get(SESSION_ID_FIELD)
+            if isinstance(extra_body, Mapping)
+            else None
+        )
         session: AGYSession | None = None
-        if self.persistent:
+        if self.persistent and isinstance(session_id, str) and session_id.strip():
+            # Only the main agent loop carries a Hermes session id. Auxiliary calls
+            # (titles, compression, search) are one-off and would only idle in the pool.
             parsed, session = self._persistent_turn(
                 selected_model,
+                effort,
+                session_id.strip(),
                 contract,
                 tool_sections,
                 normalized,
@@ -920,7 +960,9 @@ class AGYClient:
                 effective_timeout,
             )
         else:
-            parsed = self._oneshot_turn(selected_model, prompt, effective_timeout)
+            parsed = self._oneshot_turn(
+                selected_model, effort, prompt, effective_timeout
+            )
         try:
             if len(parsed.text.encode("utf-8")) > self.max_stdout_bytes:
                 raise AGYProtocolError(

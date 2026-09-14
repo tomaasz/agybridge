@@ -697,9 +697,18 @@ def _spawn_count(spawns: Path) -> int:
     return len(spawns.read_text().splitlines())
 
 
-def _session_client(module, tmp_path, stub, request, **kwargs):
+def _session_client(module, tmp_path, stub, request, session_id="s1", **kwargs):
+    """Persistent client whose requests carry a Hermes session id, like the agent loop."""
     request.addfinalizer(module.client.POOL.clear)
-    return _client(module, tmp_path, stub, persistent=True, **kwargs)
+    client = _client(module, tmp_path, stub, persistent=True, **kwargs)
+    create = client.chat.completions.create
+
+    def create_in_session(**call):
+        call.setdefault("extra_body", {"hermes_session_id": session_id})
+        return create(**call)
+
+    client.chat.completions.create = create_in_session
+    return client
 
 
 def test_persistent_session_reuses_process_and_sends_only_new_messages(
@@ -838,3 +847,70 @@ def test_persistent_mode_is_opt_in_and_idle_sessions_expire(
     ]
     client.chat.completions.create(messages=history)
     assert _spawn_count(spawns) == 2
+
+
+def test_persistent_mode_needs_a_session_id_and_keeps_one_process_per_session(
+    monkeypatch, tmp_path, request
+):
+    module = _load_plugin(monkeypatch)
+    stub, log, spawns = _session_stub(tmp_path, ["r1", "r2", "r3", "r4", "r5", "r6"])
+    request.addfinalizer(module.client.POOL.clear)
+    client = _client(module, tmp_path, stub, persistent=True)
+    history = [{"role": "user", "content": "hello"}]
+    follow = history + [
+        {"role": "assistant", "content": "x"},
+        {"role": "user", "content": "again"},
+    ]
+
+    # Auxiliary calls carry no session id: one process per request, nothing pooled.
+    client.chat.completions.create(messages=history)
+    client.chat.completions.create(messages=follow)
+    assert _spawn_count(spawns) == 2
+
+    def in_session(session_id, messages):
+        return client.chat.completions.create(
+            messages=messages, extra_body={"hermes_session_id": session_id}
+        )
+
+    in_session("a", history)
+    in_session("b", follow)  # same messages, other session: never shares a process
+    assert _spawn_count(spawns) == 4
+    in_session("a", follow)
+    assert _spawn_count(spawns) == 4
+    continued_pid = _turns(log)[-1]["pid"]
+
+    in_session("a", [{"role": "user", "content": "edited"}])
+    assert _spawn_count(spawns) == 5
+    with pytest.raises(ProcessLookupError):
+        os.kill(continued_pid, 0)
+
+
+def test_hermes_reasoning_effort_maps_to_agy_effort(monkeypatch, tmp_path):
+    module = _load_plugin(monkeypatch)
+    extras = module.agy.build_api_kwargs_extras
+    assert extras(
+        reasoning_config={"enabled": True, "effort": "xhigh"}, session_id="s1"
+    ) == ({"hermes_session_id": "s1"}, {"reasoning_effort": "high"})
+    for requested, expected in (
+        ("minimal", "low"),
+        ("medium", "medium"),
+        ("ultra", "high"),
+    ):
+        config = {"enabled": True, "effort": requested}
+        assert extras(reasoning_config=config)[1] == {"reasoning_effort": expected}
+    assert extras(reasoning_config={"enabled": False})[1] == {"reasoning_effort": "low"}
+    assert extras(reasoning_config=None) == ({}, {})
+
+    capture = tmp_path / "effort.json"
+    stub = _write_stub(
+        tmp_path,
+        capture=capture,
+        events=[{"event": "result", "result": {"response": "ok"}}],
+    )
+    module.agy.create_client(
+        command=str(stub), cwd=str(tmp_path)
+    ).chat.completions.create(messages=[], reasoning_effort="medium")
+    argv = json.loads(capture.read_text())
+    assert argv[argv.index("--effort") + 1] == "medium"
+    with pytest.raises(ValueError, match="effort"):
+        module.AGYClient(cwd=str(tmp_path), effort="ultra")

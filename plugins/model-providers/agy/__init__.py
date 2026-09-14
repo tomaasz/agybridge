@@ -14,11 +14,13 @@ except ImportError as exc:  # pragma: no cover - exercised by an import subproce
     ) from exc
 
 from .client import (
+    SESSION_ID_FIELD,
     AGYClient,
     AGYError,
     AGYProcessError,
     AGYProtocolError,
     AGYTimeoutError,
+    agy_effort,
 )
 
 MODEL = "gemini-3.8-flash-high"
@@ -42,6 +44,32 @@ class AGYProfile(ProviderProfile):
     def create_client(self, **kwargs: Any) -> AGYClient:
         """Use AGY's stream-json process instead of an HTTP client."""
         return AGYClient(effort=self.effort, default_model=self.default_model, **kwargs)
+
+    def build_api_kwargs_extras(
+        self,
+        *,
+        reasoning_config: dict | None = None,
+        session_id: str | None = None,
+        **context: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Hand Hermes' reasoning effort and session id to the AGY client.
+
+        Hermes calls this with ``session_id`` for main agent requests only;
+        auxiliary requests omit it, which keeps them on one-shot processes.
+        Without a reasoning config the profile's own effort applies.
+        """
+        extra_body: dict[str, Any] = {}
+        top_level: dict[str, Any] = {}
+        if isinstance(reasoning_config, dict):
+            if reasoning_config.get("enabled") is False:
+                top_level["reasoning_effort"] = "low"
+            else:
+                effort = agy_effort(reasoning_config.get("effort"))
+                if effort:
+                    top_level["reasoning_effort"] = effort
+        if isinstance(session_id, str) and session_id.strip():
+            extra_body[SESSION_ID_FIELD] = session_id.strip()
+        return extra_body, top_level
 
     def fetch_models(
         self,
