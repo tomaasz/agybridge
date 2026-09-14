@@ -550,6 +550,25 @@ def test_denied_action_then_hermes_call_retries_once(monkeypatch, tmp_path):
     )
 
 
+def test_denied_action_then_text_response_with_denied_flag_succeeds(
+    monkeypatch, tmp_path
+):
+    module = _load_plugin(monkeypatch)
+    state, script = tmp_path / "calls", tmp_path / "denied-with-text.py"
+    script.write_text(
+        "#!/usr/bin/env python3\nimport json, pathlib\n"
+        + f"p=pathlib.Path({str(state)!r}); n=int(p.read_text())+1 if p.exists() else 1; p.write_text(str(n))\n"
+        + "result={'response': '' if n == 1 else 'All deployments finished.', 'denied_actions': [{'action':'internal'}]}\nprint(json.dumps({'event':'result','result':result}), flush=True)\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    result = _client(module, tmp_path, script).chat.completions.create(
+        messages=[{"role": "user", "content": "dokończyłeś wdrożenia?"}]
+    )
+    assert state.read_text() == "2"
+    assert result.choices[0].message.content == "All deployments finished."
+
+
 def test_denied_retry_shares_the_request_deadline(monkeypatch, tmp_path):
     module = _load_plugin(monkeypatch)
     state, script = tmp_path / "calls", tmp_path / "slow-retry.py"

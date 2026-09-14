@@ -803,7 +803,11 @@ class AGYClient:
                 argv, remaining, (stdin_message + "\n").encode("utf-8")
             )
             parsed = _parse_stream_json(stdout)
-            if not parsed.denied:
+            if (
+                not parsed.denied
+                or _TOOL_OPEN in parsed.text
+                or (attempt > 0 and bool(parsed.text.strip()))
+            ):
                 return parsed
             if attempt == 0:
                 current_prompt = prompt + "\n\n" + _DENIED_RETRY
@@ -973,7 +977,11 @@ class AGYClient:
                         f"AGY session exited with status {exc.returncode}{detail}"
                     ) from exc
                 parsed = _parse_stream_json(stdout)
-                if not parsed.denied:
+                if (
+                    not parsed.denied
+                    or _TOOL_OPEN in parsed.text
+                    or (attempt > 0 and bool(parsed.text.strip()))
+                ):
                     succeeded = True
                     return parsed
                 if attempt == 0:
