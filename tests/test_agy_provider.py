@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import stat
 import sys
 import textwrap
@@ -663,3 +664,177 @@ def test_tool_result_prompt_injection_cannot_authorize_unknown_tool(
         _client(module, tmp_path, stub).chat.completions.create(
             messages=messages, tools=[_tool()]
         )
+
+
+def _session_stub(tmp_path: Path, responses: list[str]):
+    """Multi-turn AGY stand-in: one result per stdin message, logged per pid."""
+    log, spawns = tmp_path / "turns.jsonl", tmp_path / "spawns"
+    script = tmp_path / f"agy-session-{next(_IDS)}.py"
+    script.write_text(
+        "#!/usr/bin/env python3\nimport json, os, sys, time\nfrom pathlib import Path\n"
+        f"log, spawns, responses = Path({str(log)!r}), Path({str(spawns)!r}), {responses!r}\n"
+        "with spawns.open('a') as f: f.write(str(os.getpid()) + '\\n')\n"
+        "for line in iter(sys.stdin.readline, ''):\n"
+        "    content = json.loads(line)['message']['content']\n"
+        "    with log.open('a') as f: f.write(json.dumps({'pid': os.getpid(), 'content': content}) + '\\n')\n"
+        "    reply = responses[min(len(log.read_text().splitlines()), len(responses)) - 1]\n"
+        "    if reply == '__DIE__': sys.exit(3)\n"
+        "    if reply == '__HANG__': time.sleep(30)\n"
+        "    result = {'response': '', 'denied_actions': [{'action': 'internal'}]} if reply == '__DENY__' else {'response': reply}\n"
+        "    print(json.dumps({'event': 'step_update', 'step_update': {}}), flush=True)\n"
+        "    print(json.dumps({'event': 'result', 'result': result}), flush=True)\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return script, log, spawns
+
+
+def _turns(log: Path) -> list[dict]:
+    return [json.loads(line) for line in log.read_text().splitlines()]
+
+
+def _spawn_count(spawns: Path) -> int:
+    return len(spawns.read_text().splitlines())
+
+
+def _session_client(module, tmp_path, stub, request, **kwargs):
+    request.addfinalizer(module.client.POOL.clear)
+    return _client(module, tmp_path, stub, persistent=True, **kwargs)
+
+
+def test_persistent_session_reuses_process_and_sends_only_new_messages(
+    monkeypatch, tmp_path, request
+):
+    module = _load_plugin(monkeypatch)
+    stub, log, spawns = _session_stub(tmp_path, ["first", "second"])
+    client = _session_client(module, tmp_path, stub, request)
+    history = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hello"},
+    ]
+    assert (
+        client.chat.completions.create(messages=history).choices[0].message.content
+        == "first"
+    )
+    history += [
+        {"role": "assistant", "content": "first"},
+        {"role": "user", "content": "again"},
+    ]
+    assert (
+        client.chat.completions.create(messages=history).choices[0].message.content
+        == "second"
+    )
+    first, second = _turns(log)
+    assert _spawn_count(spawns) == 1 and first["pid"] == second["pid"]
+    assert "hello" in first["content"]
+    assert second["content"].startswith("HERMES_CONVERSATION_DELTA_JSON")
+    assert "again" in second["content"] and "hello" not in second["content"]
+
+
+def test_persistent_session_follows_tool_calls_and_restarts_on_divergence(
+    monkeypatch, tmp_path, request
+):
+    module = _load_plugin(monkeypatch)
+    stub, _log, spawns = _session_stub(tmp_path, [_call(), "done", "fresh", "other"])
+    client = _session_client(module, tmp_path, stub, request)
+    base = [{"role": "user", "content": "read it"}]
+    first = client.chat.completions.create(messages=base, tools=[_tool()])
+    call = first.choices[0].message.tool_calls[0]
+    follow = base + [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": call.function.arguments,
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": call.id, "content": "file body"},
+    ]
+    done = client.chat.completions.create(messages=follow, tools=[_tool()])
+    assert done.choices[0].message.content == "done" and _spawn_count(spawns) == 1
+
+    edited = [{"role": "user", "content": "read something else"}, *follow[1:]]
+    fresh = client.chat.completions.create(messages=edited, tools=[_tool()])
+    assert fresh.choices[0].message.content == "fresh" and _spawn_count(spawns) == 2
+
+    extended = follow + [
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "more"},
+    ]
+    other = client.chat.completions.create(
+        model="other-model", messages=extended, tools=[_tool()]
+    )
+    assert other.choices[0].message.content == "other" and _spawn_count(spawns) == 3
+
+
+def test_persistent_session_is_discarded_after_failure_or_timeout(
+    monkeypatch, tmp_path, request
+):
+    module = _load_plugin(monkeypatch)
+    stub, log, spawns = _session_stub(
+        tmp_path, ["first", "__DIE__", "third", "__HANG__"]
+    )
+    client = _session_client(module, tmp_path, stub, request, timeout=1)
+    history = [{"role": "user", "content": "hello"}]
+    client.chat.completions.create(messages=history)
+    history += [
+        {"role": "assistant", "content": "first"},
+        {"role": "user", "content": "again"},
+    ]
+    with pytest.raises(module.AGYProcessError, match="status 3"):
+        client.chat.completions.create(messages=history)
+    retried = client.chat.completions.create(messages=history)
+    assert retried.choices[0].message.content == "third" and _spawn_count(spawns) == 2
+    history += [
+        {"role": "assistant", "content": "third"},
+        {"role": "user", "content": "hang"},
+    ]
+    with pytest.raises(module.AGYTimeoutError):
+        client.chat.completions.create(messages=history)
+    with pytest.raises(ProcessLookupError):
+        os.kill(_turns(log)[-1]["pid"], 0)
+
+
+def test_persistent_denied_retry_stays_in_the_same_session(
+    monkeypatch, tmp_path, request
+):
+    module = _load_plugin(monkeypatch)
+    stub, log, spawns = _session_stub(tmp_path, ["__DENY__", "ok"])
+    client = _session_client(module, tmp_path, stub, request)
+    result = client.chat.completions.create(
+        messages=[{"role": "user", "content": "hi"}]
+    )
+    first, second = _turns(log)
+    assert result.choices[0].message.content == "ok" and _spawn_count(spawns) == 1
+    assert first["pid"] == second["pid"]
+    assert second["content"] == module.client._DENIED_RETRY
+
+
+def test_persistent_mode_is_opt_in_and_idle_sessions_expire(
+    monkeypatch, tmp_path, request
+):
+    module = _load_plugin(monkeypatch)
+    monkeypatch.delenv("HERMES_AGY_PERSISTENT", raising=False)
+    assert module.AGYClient(cwd=str(tmp_path)).persistent is False
+    monkeypatch.setenv("HERMES_AGY_PERSISTENT", "1")
+    assert module.AGYClient(cwd=str(tmp_path)).persistent is True
+
+    monkeypatch.setenv("HERMES_AGY_SESSION_IDLE_SECONDS", "0.05")
+    stub, _log, spawns = _session_stub(tmp_path, ["first", "second"])
+    client = _session_client(module, tmp_path, stub, request)
+    history = [{"role": "user", "content": "hello"}]
+    client.chat.completions.create(messages=history)
+    time.sleep(0.2)
+    history += [
+        {"role": "assistant", "content": "first"},
+        {"role": "user", "content": "again"},
+    ]
+    client.chat.completions.create(messages=history)
+    assert _spawn_count(spawns) == 2

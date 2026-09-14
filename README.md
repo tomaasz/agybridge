@@ -39,6 +39,34 @@ flowchart LR
     H -->|tool result as untrusted data| P
 ```
 
+## Persistent AGY sessions (prototype)
+
+By default every request starts a new AGY process. Setting
+`HERMES_AGY_PERSISTENT=1` keeps finished AGY processes in a small in-memory
+pool instead. A request reuses an idle process only when its messages are an
+unchanged continuation of the conversation that process already holds: the
+previous request's messages match exactly, the next message is the assistant
+reply with the same tool-call IDs, and no new system message follows. Only the
+new messages are then sent to AGY.
+
+Anything else starts a fresh process: an edited or compressed history, a
+different model, effort, tool list, command, working directory or environment,
+or a new system message. A process is discarded, never reused, after a timeout,
+exit, oversized output, protocol error, or two denied actions, because AGY keeps
+running an unfinished turn and would merge it into the next one. The provider
+enforces its own turn deadline, so AGY's `--print-timeout` is set to one day.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HERMES_AGY_PERSISTENT` | off | enable the pool |
+| `HERMES_AGY_SESSION_IDLE_SECONDS` | `900` | kill a process idle this long |
+| `HERMES_AGY_MAX_SESSIONS` | `4` | idle processes kept; the least recently used goes first |
+
+Each request logs `AGY session reused (turn N): …` or
+`AGY session started (<reason>)` at INFO level, which shows how often reuse
+actually happens. Idle processes exit on their own when Hermes exits, because
+their stdin closes.
+
 ## Requirements and compatibility
 
 - Hermes Agent **0.21.2 or newer**, including `ProviderProfile.create_client`
