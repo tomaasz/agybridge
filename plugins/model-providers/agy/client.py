@@ -580,7 +580,9 @@ class AGYClient:
         with contextlib.suppress(Exception):
             process.wait(timeout=self.terminate_grace)
 
-    def _run_process(self, argv: list[str], timeout: float) -> tuple[bytes, bytes]:
+    def _run_process(
+        self, argv: list[str], timeout: float, stdin_data: bytes | None = None
+    ) -> tuple[bytes, bytes]:
         popen_kwargs: dict[str, Any] = {}
         if os.name == "posix":
             popen_kwargs["start_new_session"] = True
@@ -589,7 +591,7 @@ class AGYClient:
                 argv,
                 cwd=self.cwd,
                 env=self._child_env,
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL if stdin_data is None else subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 **popen_kwargs,
@@ -650,6 +652,18 @@ class AGYClient:
             )
             out_thread.start()
             err_thread.start()
+            if stdin_data is not None:
+                # Feed stdin from its own thread so a prompt larger than the
+                # pipe buffer cannot deadlock against AGY writing stdout.
+                def feed(stream: Any) -> None:
+                    with contextlib.suppress(OSError, ValueError):
+                        stream.write(stdin_data)
+                    with contextlib.suppress(OSError, ValueError):
+                        stream.close()
+
+                threading.Thread(
+                    target=feed, args=(process.stdin,), daemon=True
+                ).start()
             deadline = time.monotonic() + timeout
             timed_out = False
             while process.poll() is None:
@@ -729,10 +743,10 @@ class AGYClient:
             "--disable-slash-commands",
             "--print-timeout",
             f"{max(1, math.ceil(effective_timeout))}s",
+            "--input-format",
+            "stream-json",
             "--output-format",
             "stream-json",
-            "--print",
-            prompt,
         ]
         parsed: _ParsedOutput | None = None
         current_prompt = prompt
@@ -745,8 +759,15 @@ class AGYClient:
                     f"AGY exceeded the {effective_timeout:g}s request timeout"
                 )
             argv[print_timeout_index] = f"{max(1, math.ceil(remaining))}s"
-            argv[-1] = current_prompt
-            stdout, _stderr = self._run_process(argv, remaining)
+            # The prompt goes over stdin: Linux caps a single argv element at
+            # 128 KiB (E2BIG), far below max_prompt_bytes.
+            stdin_message = json.dumps(
+                {"event": "user", "message": {"content": current_prompt}},
+                ensure_ascii=False,
+            )
+            stdout, _stderr = self._run_process(
+                argv, remaining, (stdin_message + "\n").encode("utf-8")
+            )
             parsed = _parse_stream_json(stdout)
             if not parsed.denied:
                 break

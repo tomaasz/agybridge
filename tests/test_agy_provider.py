@@ -123,6 +123,7 @@ def _write_stub(
     event_json = json.dumps(events, ensure_ascii=False)
     capture_code = (
         f"Path({str(capture)!r}).write_text(json.dumps(sys.argv[1:]), encoding='utf-8')\n"
+        f"Path({str(capture) + '.stdin'!r}).write_bytes(sys.stdin.buffer.read())\n"
         if capture
         else ""
     )
@@ -151,6 +152,14 @@ def _write_stub(
     )
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     return script
+
+
+def _captured_prompt(capture: Path) -> str:
+    lines = Path(str(capture) + ".stdin").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    message = json.loads(lines[0])
+    assert message["event"] == "user"
+    return message["message"]["content"]
 
 
 def _client(module, tmp_path, stub, **kwargs):
@@ -220,10 +229,31 @@ def test_forwards_model_effort_read_only_and_schema(monkeypatch, tmp_path):
     assert argv[argv.index("--model") + 1] == "custom-model"
     assert argv[argv.index("--effort") + 1] == "low"
     assert argv[argv.index("--mode") + 1] == "plan"
+    assert argv[argv.index("--input-format") + 1] == "stream-json"
+    assert "--print" not in argv
     assert (
         "--sandbox" in argv
         and "--disable-slash-commands" in argv
-        and "Available tools" in argv[-1]
+        and "Available tools" in _captured_prompt(capture)
+    )
+
+
+def test_large_prompt_is_sent_over_stdin(monkeypatch, tmp_path):
+    module = _load_plugin(monkeypatch)
+    capture = tmp_path / "large.json"
+    stub = _write_stub(
+        tmp_path,
+        capture=capture,
+        events=[{"event": "result", "result": {"response": "done"}}],
+    )
+    big = "ż" * 150_000  # 300 KB of UTF-8, well past Linux's 128 KiB argv limit
+    response = _client(module, tmp_path, stub).chat.completions.create(
+        messages=[{"role": "user", "content": big}]
+    )
+    assert response.choices[0].message.content == "done"
+    assert big in _captured_prompt(capture)
+    assert all(
+        len(arg.encode("utf-8")) < 4096 for arg in json.loads(capture.read_text())
     )
 
 
@@ -338,7 +368,7 @@ def test_tool_choice_none_and_forced_required(monkeypatch, tmp_path):
     _client(module, tmp_path, stub).chat.completions.create(
         messages=[], tools=[_tool()], tool_choice="none"
     )
-    assert "Available tools" not in " ".join(json.loads(capture.read_text()))
+    assert "Available tools" not in _captured_prompt(capture)
     forced = {"type": "function", "function": {"name": "read_file"}}
     stub2 = _write_stub(
         tmp_path, events=[{"event": "result", "result": {"response": _call()}}]

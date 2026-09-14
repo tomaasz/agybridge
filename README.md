@@ -9,6 +9,9 @@ results. AGY is a bounded text-only reasoning subprocess.
 
 The provider always starts AGY with `--mode plan --sandbox` and disables slash
 commands. It passes no shell command string: every option is an argv element.
+The prompt itself is never an argument: it is written to AGY's stdin as one
+`--input-format stream-json` user message, so large conversations are not
+limited by the operating system's per-argument size cap (128 KiB on Linux).
 The child receives a small operating-system environment allowlist. Credential
 variables, including `GOOGLE_*`, `GEMINI_*`, and `AGY_*`, are not forwarded
 automatically. If an AGY installation needs a particular variable, pass its
@@ -28,7 +31,7 @@ ownership model. Writes must be requested as Hermes tool calls.
 ```mermaid
 flowchart LR
     H[Hermes Agent] -->|messages + tool schemas| P[AGY provider]
-    P -->|argv: plan + sandbox| A[AGY CLI]
+    P -->|argv: plan + sandbox, prompt via stdin| A[AGY CLI]
     A -->|stream-json response| P
     P -->|validated OpenAI-shaped response| H
     H --> T[Hermes dispatcher]
