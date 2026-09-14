@@ -20,6 +20,12 @@ PLUGIN = (
 _IDS = count()
 
 
+@pytest.fixture(autouse=True)
+def _isolated_session_store(monkeypatch, tmp_path):
+    """Keep the resumable-conversation store out of the real ~/.hermes."""
+    monkeypatch.setenv("HERMES_AGY_SESSION_STORE", str(tmp_path / "agy-store.json"))
+
+
 def _install_hermes_stubs(monkeypatch):
     bridge = types.ModuleType("agent.acp_openai_bridge")
 
@@ -673,7 +679,9 @@ def _session_stub(tmp_path: Path, responses: list[str]):
     script.write_text(
         "#!/usr/bin/env python3\nimport json, os, sys, time\nfrom pathlib import Path\n"
         f"log, spawns, responses = Path({str(log)!r}), Path({str(spawns)!r}), {responses!r}\n"
-        "with spawns.open('a') as f: f.write(str(os.getpid()) + '\\n')\n"
+        "conv = sys.argv[sys.argv.index('--conversation') + 1] if '--conversation' in sys.argv else 'conv-' + str(os.getpid())\n"
+        "with spawns.open('a') as f: f.write(json.dumps({'pid': os.getpid(), 'argv': sys.argv[1:]}) + '\\n')\n"
+        "print(json.dumps({'event': 'init', 'init': {'conversation_id': conv}}), flush=True)\n"
         "for line in iter(sys.stdin.readline, ''):\n"
         "    content = json.loads(line)['message']['content']\n"
         "    with log.open('a') as f: f.write(json.dumps({'pid': os.getpid(), 'content': content}) + '\\n')\n"
@@ -695,6 +703,85 @@ def _turns(log: Path) -> list[dict]:
 
 def _spawn_count(spawns: Path) -> int:
     return len(spawns.read_text().splitlines())
+
+
+def _spawns(spawns: Path) -> list[dict]:
+    return [json.loads(line) for line in spawns.read_text().splitlines()]
+
+
+def test_persistent_session_resumes_agy_conversation_after_restart(
+    monkeypatch, tmp_path, request
+):
+    module = _load_plugin(monkeypatch)
+    stub, log, spawns = _session_stub(tmp_path, ["first", "second"])
+    client = _session_client(module, tmp_path, stub, request)
+    history = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hello"},
+    ]
+    client.chat.completions.create(messages=history)
+    module.client.POOL.clear()  # a gateway restart drops every live process
+    history += [
+        {"role": "assistant", "content": "first"},
+        {"role": "user", "content": "again"},
+    ]
+    result = client.chat.completions.create(messages=history)
+    first, second = _spawns(spawns)
+    assert result.choices[0].message.content == "second"
+    assert "--conversation" not in first["argv"]
+    assert second["argv"][second["argv"].index("--conversation") + 1] == (
+        f"conv-{first['pid']}"
+    )
+    resumed_turn = _turns(log)[1]["content"]
+    assert resumed_turn.startswith("HERMES_CONVERSATION_DELTA_JSON")
+    assert "again" in resumed_turn and "hello" not in resumed_turn
+    stored = (tmp_path / "agy-store.json").read_text()
+    assert set(json.loads(stored)) == {"s1"} and "hello" not in stored
+
+
+def test_failed_resume_falls_back_to_a_fresh_process_in_the_same_request(
+    monkeypatch, tmp_path, request
+):
+    module = _load_plugin(monkeypatch)
+    stub, log, spawns = _session_stub(tmp_path, ["first", "__DIE__", "fresh"])
+    client = _session_client(module, tmp_path, stub, request)
+    history = [{"role": "user", "content": "hello"}]
+    client.chat.completions.create(messages=history)
+    module.client.POOL.clear()
+    history += [
+        {"role": "assistant", "content": "first"},
+        {"role": "user", "content": "again"},
+    ]
+    result = client.chat.completions.create(messages=history)
+    _, resumed, fresh = _spawns(spawns)
+    assert result.choices[0].message.content == "fresh"
+    assert "--conversation" in resumed["argv"] and "--conversation" not in fresh["argv"]
+    assert "HERMES_CONVERSATION_JSON" in _turns(log)[2]["content"]
+
+
+def test_conversation_store_skips_in_flight_or_incompatible_records(
+    monkeypatch, tmp_path
+):
+    module = _load_plugin(monkeypatch)
+    store = module.session.STORE
+    history = [{"role": "user", "content": "hello"}]
+    follow = history + [
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "again"},
+    ]
+    store.record("s9", conversation_id="c9", compat="k", history=history, reply_ids=())
+    assert store.resume_point("s9", "k", follow) == ("c9", follow[2:])
+    assert store.resume_point("s9", "other", follow) is None
+    edited = [{"role": "user", "content": "edited"}, *follow[1:]]
+    assert store.resume_point("s9", "k", edited) is None
+    store.mark_in_flight("s9")
+    assert store.resume_point("s9", "k", follow) is None
+    store.forget("s9")
+    assert store.resume_point("s9", "k", follow) is None
+
+    monkeypatch.setenv("HERMES_AGY_SESSION_STORE", "off")
+    store.record("s9", conversation_id="c9", compat="k", history=history, reply_ids=())
+    assert store.resume_point("s9", "k", follow) is None
 
 
 def _session_client(module, tmp_path, stub, request, session_id="s1", **kwargs):

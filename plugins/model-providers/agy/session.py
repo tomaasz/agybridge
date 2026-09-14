@@ -11,15 +11,24 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import hashlib
 import json
+import logging
 import os
 import queue
+import re
 import signal
 import subprocess
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised on Windows CI
+    fcntl = None  # type: ignore[assignment]
 
 PERSISTENT_ENV = "HERMES_AGY_PERSISTENT"
 IDLE_SECONDS_ENV = "HERMES_AGY_SESSION_IDLE_SECONDS"
@@ -31,6 +40,13 @@ DEFAULT_MAX_SESSIONS = 4
 # deadline and kills the process instead, so AGY's timer must never fire first.
 PRINT_TIMEOUT = "86400s"
 _EOF = object()
+
+SESSION_STORE_ENV = "HERMES_AGY_SESSION_STORE"
+STORE_MAX_ENTRIES = 500
+STORE_MAX_AGE_SECONDS = 7 * 24 * 3600
+_CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+logger = logging.getLogger(__name__)
 
 
 def persistent_enabled() -> bool:
@@ -103,6 +119,11 @@ class AGYSession:
         self.key = key
         self.history: list[dict[str, Any]] | None = None
         self.reply_ids: tuple[str, ...] = ()
+        # AGY's own id for this conversation, read from the stream; lets a later
+        # process continue it with --conversation.
+        self.conversation_id: str | None = None
+        # (Hermes session id, compatibility digest) used for the on-disk store.
+        self.store_key: tuple[str, str] | None = None
         self.turns = 0
         self.last_used = time.monotonic()
         self.terminate_grace = terminate_grace
@@ -117,8 +138,21 @@ class AGYSession:
         with contextlib.suppress(OSError, ValueError):
             for line in iter(self.process.stdout.readline, b""):
                 if line.strip():
+                    self._note_conversation(line)
                     self._lines.put(line)
         self._lines.put(_EOF)
+
+    def _note_conversation(self, line: bytes) -> None:
+        if self.conversation_id is not None or b"conversation_id" not in line:
+            return
+        with contextlib.suppress(ValueError):
+            event = json.loads(line)
+            for field in ("init", "result"):
+                body = event.get(field) if isinstance(event, dict) else None
+                value = body.get("conversation_id") if isinstance(body, dict) else None
+                if isinstance(value, str) and _CONVERSATION_ID_RE.fullmatch(value):
+                    self.conversation_id = value
+                    return
 
     def _drain_stderr(self) -> None:
         with contextlib.suppress(OSError, ValueError):
@@ -210,25 +244,49 @@ class AGYSession:
             self.process.wait(timeout=self.terminate_grace)
 
 
+def history_digest(messages: list[dict[str, Any]]) -> str:
+    """Stable digest of normalized messages; the store keeps this, never content."""
+    encoded = json.dumps(
+        messages, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _continuation(
+    messages: list[dict[str, Any]],
+    prefix_len: int,
+    prefix_matches: Callable[[list[dict[str, Any]]], bool],
+    reply_ids: tuple[str, ...],
+) -> list[dict[str, Any]] | None:
+    """Messages after an already-answered prefix, or None if they diverge.
+
+    The prefix must match, the next message must be the assistant reply with
+    the same tool-call ids, and no system or developer message may follow.
+    """
+    if len(messages) <= prefix_len + 1 or not prefix_matches(messages[:prefix_len]):
+        return None
+    reply = messages[prefix_len]
+    if reply.get("role") != "assistant":
+        return None
+    ids = tuple(str(call.get("id", "")) for call in reply.get("tool_calls", []))
+    if ids != reply_ids:
+        return None
+    delta = messages[prefix_len + 1 :]
+    if any(message.get("role") in {"system", "developer"} for message in delta):
+        return None
+    return delta
+
+
 def _delta(
     session: AGYSession, messages: list[dict[str, Any]]
 ) -> list[dict[str, Any]] | None:
     """New messages after the session's last reply, or None if they diverge."""
     previous = session.history
-    if previous is None or len(messages) <= len(previous) + 1:
+    if previous is None:
         return None
-    if messages[: len(previous)] != previous:
-        return None
-    reply = messages[len(previous)]
-    if reply.get("role") != "assistant":
-        return None
-    reply_ids = tuple(str(call.get("id", "")) for call in reply.get("tool_calls", []))
-    if reply_ids != session.reply_ids:
-        return None
-    delta = messages[len(previous) + 1 :]
-    if any(message.get("role") in {"system", "developer"} for message in delta):
-        return None
-    return delta
+    return _continuation(
+        messages, len(previous), lambda prefix: prefix == previous, session.reply_ids
+    )
 
 
 class SessionPool:
@@ -324,5 +382,162 @@ class SessionPool:
             session.stop()
 
 
+def store_path() -> Path | None:
+    """Where resumable conversations are recorded, or None when disabled."""
+    raw = os.environ.get(SESSION_STORE_ENV)
+    if raw is not None:
+        raw = raw.strip()
+        if raw.lower() in {"", "0", "off", "false", "no"}:
+            return None
+        return Path(raw).expanduser()
+    home = os.environ.get("HERMES_HOME") or "~/.hermes"
+    return Path(home).expanduser() / "state" / "agy-conversations.json"
+
+
+def _load_store(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+class ConversationStore:
+    """On-disk map of Hermes session id to a resumable AGY conversation.
+
+    It survives gateway restarts, which drop every pooled process. It holds
+    ids and digests only, never message content. Every Hermes process on the
+    machine shares the file, so writes take an exclusive lock and replace the
+    file atomically; reads need no lock.
+
+    A record is marked in flight while a turn runs in its conversation. If the
+    process dies mid-turn (a restart kills it), AGY's conversation holds an
+    unfinished turn, so an in-flight record is never resumed.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def _change(self, change: Callable[[dict[str, Any]], bool | None]) -> None:
+        path = store_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with (
+                self._lock,
+                open(f"{path}.lock", "a+", encoding="utf-8") as lock_file,
+            ):
+                if fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                data = _load_store(path)
+                if change(data) is False:
+                    return
+                now = time.time()
+                kept = sorted(
+                    (
+                        item
+                        for item in data.items()
+                        if isinstance(item[1], dict)
+                        and now - float(item[1].get("updated", 0))
+                        < STORE_MAX_AGE_SECONDS
+                    ),
+                    key=lambda item: float(item[1].get("updated", 0)),
+                    reverse=True,
+                )[:STORE_MAX_ENTRIES]
+                temporary = path.with_name(
+                    f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                )
+                descriptor = os.open(
+                    temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+                )
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump(dict(kept), handle)
+                os.replace(temporary, path)
+        except (OSError, TypeError, ValueError):
+            logger.debug("AGY conversation store update failed", exc_info=True)
+
+    def resume_point(
+        self, session_id: str, compat: str, messages: list[dict[str, Any]]
+    ) -> tuple[str, list[dict[str, Any]]] | None:
+        """The AGY conversation id and the new messages, if ``messages`` continue it."""
+        path = store_path()
+        if path is None:
+            return None
+        record = _load_store(path).get(session_id)
+        if (
+            not isinstance(record, dict)
+            or record.get("in_flight")
+            or record.get("compat") != compat
+        ):
+            return None
+        conversation_id = record.get("conversation_id")
+        length = record.get("history_len")
+        digest = record.get("history_digest")
+        reply_ids = record.get("reply_ids")
+        if not (
+            isinstance(conversation_id, str)
+            and _CONVERSATION_ID_RE.fullmatch(conversation_id)
+            and isinstance(length, int)
+            and not isinstance(length, bool)
+            and isinstance(digest, str)
+            and isinstance(reply_ids, list)
+        ):
+            return None
+        delta = _continuation(
+            messages,
+            length,
+            lambda prefix: history_digest(prefix) == digest,
+            tuple(str(item) for item in reply_ids),
+        )
+        return None if delta is None else (conversation_id, delta)
+
+    def record(
+        self,
+        session_id: str,
+        *,
+        conversation_id: str,
+        compat: str,
+        history: list[dict[str, Any]],
+        reply_ids: tuple[str, ...],
+    ) -> None:
+        """Remember a completed turn so a later process can resume after it."""
+        entry = {
+            "conversation_id": conversation_id,
+            "compat": compat,
+            "history_len": len(history),
+            "history_digest": history_digest(history),
+            "reply_ids": list(reply_ids),
+            "in_flight": False,
+            "updated": time.time(),
+        }
+
+        def change(data: dict[str, Any]) -> None:
+            data[session_id] = entry
+
+        self._change(change)
+
+    def mark_in_flight(self, session_id: str) -> None:
+        def change(data: dict[str, Any]) -> bool | None:
+            entry = data.get(session_id)
+            if not isinstance(entry, dict):
+                return False
+            entry["in_flight"] = True
+            entry["updated"] = time.time()
+            return None
+
+        self._change(change)
+
+    def forget(self, session_id: str) -> None:
+        def change(data: dict[str, Any]) -> bool | None:
+            if session_id not in data:
+                return False
+            del data[session_id]
+            return None
+
+        self._change(change)
+
+
 POOL = SessionPool()
 atexit.register(POOL.clear)
+STORE = ConversationStore()

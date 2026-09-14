@@ -73,6 +73,21 @@ Each request logs `AGY session reused (turn N): …` or
 actually happens. Idle processes exit on their own when Hermes exits, because
 their stdin closes.
 
+### Resuming after a restart
+
+A gateway restart drops every pooled process. After each completed turn the
+provider records the AGY conversation id for the Hermes session in
+`$HERMES_HOME/state/agy-conversations.json` (override with
+`HERMES_AGY_SESSION_STORE`; `off` disables it). The record holds ids and a
+SHA-256 digest of the history, never message content. When a session has no
+live process but its history continues the recorded one, a new process starts
+with `--conversation <id>` and receives only the new messages.
+
+A record is marked in flight while a turn runs; if the process dies mid-turn,
+AGY's conversation holds an unfinished turn and the record is not resumed. If
+AGY cannot resume the conversation, the same request retries once with the
+full prompt in a fresh process. Records older than seven days are dropped.
+
 ## Reasoning effort
 
 AGY accepts `low`, `medium`, and `high`. The **AGY** profile defaults to `high`

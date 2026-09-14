@@ -34,6 +34,7 @@ except ImportError as exc:  # pragma: no cover - exercised by an import subproce
 from .session import (
     POOL,
     PRINT_TIMEOUT,
+    STORE,
     AGYSession,
     SessionDied,
     SessionOverflow,
@@ -838,7 +839,10 @@ class AGYClient:
                 fingerprint,
             ),
         )
+        compat = hashlib.sha256(repr(key[1]).encode("utf-8")).hexdigest()
+        prompt_bytes = len(prompt.encode("utf-8"))
         session, delta, reason = POOL.checkout(key, normalized)
+        resumed_from: str | None = None
         if session is not None and delta is not None:
             content = _DELTA_HEADER + json.dumps(
                 delta, ensure_ascii=False, separators=(",", ":")
@@ -848,29 +852,95 @@ class AGYClient:
                 session.turns + 1,
                 len(delta),
                 len(content.encode("utf-8")),
-                len(prompt.encode("utf-8")),
+                prompt_bytes,
             )
+            STORE.mark_in_flight(session_id)
         else:
-            try:
-                session = AGYSession(
-                    key,
-                    self._argv(model, PRINT_TIMEOUT, effort),
-                    cwd=self.cwd,
-                    env=self._child_env,
-                    max_stderr_bytes=self.max_stderr_bytes,
-                    terminate_grace=self.terminate_grace,
+            resume = STORE.resume_point(session_id, compat, normalized)
+            if resume is not None:
+                resumed_from, delta = resume
+                content = _DELTA_HEADER + json.dumps(
+                    delta, ensure_ascii=False, separators=(",", ":")
                 )
-            except FileNotFoundError as exc:
-                raise AGYProcessError(
-                    f"AGY executable {Path(self.command).name!r} was not found"
-                ) from exc
-            except OSError as exc:
-                raise AGYProcessError(
-                    f"AGY executable {Path(self.command).name!r} could not be started"
-                ) from exc
-            content = prompt
-            logger.info("AGY session started (%s)", reason)
+                session = self._start_session(key, model, effort, resumed_from)
+                logger.info(
+                    "AGY session resumed (conversation %s): %d new message(s), %d of %d prompt bytes",
+                    resumed_from,
+                    len(delta),
+                    len(content.encode("utf-8")),
+                    prompt_bytes,
+                )
+                STORE.mark_in_flight(session_id)
+            else:
+                STORE.forget(session_id)
+                session = self._start_session(key, model, effort, None)
+                content = prompt
+                logger.info("AGY session started (%s)", reason)
+        session.store_key = (session_id, compat)
+        try:
+            return self._drive_session(
+                session, content, deadline, effective_timeout
+            ), session
+        except AGYProcessError:
+            if resumed_from is None:
+                STORE.forget(session_id)
+                raise
+            logger.warning(
+                "AGY conversation %s could not be resumed; starting a fresh one",
+                resumed_from,
+            )
+        except BaseException:
+            STORE.forget(session_id)
+            raise
+        # AGY may have expired or rejected the stored conversation: the same
+        # request retries once with the full prompt in a fresh process.
+        STORE.forget(session_id)
+        session = self._start_session(key, model, effort, None)
+        session.store_key = (session_id, compat)
+        try:
+            return self._drive_session(
+                session, prompt, deadline, effective_timeout
+            ), session
+        except BaseException:
+            STORE.forget(session_id)
+            raise
 
+    def _start_session(
+        self,
+        key: tuple[Any, ...],
+        model: str,
+        effort: str,
+        conversation_id: str | None,
+    ) -> AGYSession:
+        argv = self._argv(model, PRINT_TIMEOUT, effort)
+        if conversation_id:
+            argv += ["--conversation", conversation_id]
+        try:
+            return AGYSession(
+                key,
+                argv,
+                cwd=self.cwd,
+                env=self._child_env,
+                max_stderr_bytes=self.max_stderr_bytes,
+                terminate_grace=self.terminate_grace,
+            )
+        except FileNotFoundError as exc:
+            raise AGYProcessError(
+                f"AGY executable {Path(self.command).name!r} was not found"
+            ) from exc
+        except OSError as exc:
+            raise AGYProcessError(
+                f"AGY executable {Path(self.command).name!r} could not be started"
+            ) from exc
+
+    def _drive_session(
+        self,
+        session: AGYSession,
+        content: str,
+        deadline: float,
+        effective_timeout: float,
+    ) -> _ParsedOutput:
+        """Run one Hermes request in ``session``; the session is stopped on failure."""
         with self._process_lock:
             closed = self.is_closed
             if not closed:
@@ -905,7 +975,7 @@ class AGYClient:
                 parsed = _parse_stream_json(stdout)
                 if not parsed.denied:
                     succeeded = True
-                    return parsed, session
+                    return parsed
                 if attempt == 0:
                     content = _DENIED_RETRY
             raise AGYProcessError(
@@ -997,6 +1067,8 @@ class AGYClient:
         except BaseException:
             if session is not None:
                 session.stop()
+                if session.store_key is not None:
+                    STORE.forget(session.store_key[0])
             raise
         if session is not None:
             # Only a fully validated turn may be continued: Hermes retries a
@@ -1007,6 +1079,14 @@ class AGYClient:
                 session.stop()
             else:
                 POOL.checkin(session)
+            if session.store_key is not None and session.conversation_id:
+                STORE.record(
+                    session.store_key[0],
+                    conversation_id=session.conversation_id,
+                    compat=session.store_key[1],
+                    history=normalized,
+                    reply_ids=session.reply_ids,
+                )
         usage = SimpleNamespace(
             **parsed.usage, prompt_tokens_details=SimpleNamespace(cached_tokens=0)
         )
