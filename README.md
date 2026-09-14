@@ -80,6 +80,12 @@ and **AGY Fast** to `low`. When Hermes sends a reasoning effort, it is mapped
 per request: `minimal`/`low` → `low`, `medium` → `medium`,
 `high`/`xhigh`/`max`/`ultra` → `high`, and reasoning turned off → `low`.
 
+AGY ties an effort suffix in a model id to that effort:
+`gemini-3.8-flash-high` runs only with `--effort high` and
+`gemini-3.8-flash-low` only with `low`, while `gemini-3.8-flash` accepts all
+three. Without a requested effort the suffix decides; when Hermes asks for a
+different one, the provider sends the bare model id with that effort.
+
 ## Requirements and compatibility
 
 - Hermes Agent **0.21.2 or newer**, including `ProviderProfile.create_client`

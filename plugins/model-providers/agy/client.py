@@ -135,6 +135,24 @@ def agy_effort(value: Any) -> str | None:
     return _EFFORT_ALIASES.get(value.strip().lower())
 
 
+def _agy_model_and_effort(
+    model: str, requested: str | None, default: str
+) -> tuple[str, str]:
+    """Pick the AGY model id and --effort for one request.
+
+    AGY rejects a model id whose effort suffix disagrees with --effort
+    (``gemini-3.8-flash-high`` runs only with ``high``), while the bare id
+    accepts every effort. Without a requested effort the suffix wins; a
+    different requested effort switches to the bare id.
+    """
+    base, _, suffix = model.rpartition("-")
+    if not base or suffix not in AGY_EFFORTS:
+        return model, requested or default
+    if requested is None or requested == suffix:
+        return model, suffix
+    return base, requested
+
+
 class AGYError(RuntimeError):
     """Base error exposed by the provider."""
 
@@ -939,7 +957,9 @@ class AGYClient:
             raise AGYProtocolError(
                 f"Hermes prompt exceeds the {self.max_prompt_bytes}-byte AGY limit"
             )
-        effort = agy_effort(reasoning_effort) or self.effort
+        agy_model, effort = _agy_model_and_effort(
+            selected_model, agy_effort(reasoning_effort), self.effort
+        )
         session_id = (
             extra_body.get(SESSION_ID_FIELD)
             if isinstance(extra_body, Mapping)
@@ -950,7 +970,7 @@ class AGYClient:
             # Only the main agent loop carries a Hermes session id. Auxiliary calls
             # (titles, compression, search) are one-off and would only idle in the pool.
             parsed, session = self._persistent_turn(
-                selected_model,
+                agy_model,
                 effort,
                 session_id.strip(),
                 contract,
@@ -960,9 +980,7 @@ class AGYClient:
                 effective_timeout,
             )
         else:
-            parsed = self._oneshot_turn(
-                selected_model, effort, prompt, effective_timeout
-            )
+            parsed = self._oneshot_turn(agy_model, effort, prompt, effective_timeout)
         try:
             if len(parsed.text.encode("utf-8")) > self.max_stdout_bytes:
                 raise AGYProtocolError(

@@ -912,5 +912,15 @@ def test_hermes_reasoning_effort_maps_to_agy_effort(monkeypatch, tmp_path):
     ).chat.completions.create(messages=[], reasoning_effort="medium")
     argv = json.loads(capture.read_text())
     assert argv[argv.index("--effort") + 1] == "medium"
+    # gemini-3.8-flash-high accepts only --effort high; the bare id takes any.
+    assert argv[argv.index("--model") + 1] == "gemini-3.8-flash"
+
+    resolve = module.client._agy_model_and_effort
+    flash_high, flash_low = "gemini-3.8-flash-high", "gemini-3.8-flash-low"
+    assert resolve(flash_high, None, "low") == (flash_high, "high")
+    assert resolve(flash_high, "high", "low") == (flash_high, "high")
+    assert resolve(flash_low, "medium", "low") == ("gemini-3.8-flash", "medium")
+    assert resolve("custom-model", None, "low") == ("custom-model", "low")
+    assert resolve("custom-model", "high", "low") == ("custom-model", "high")
     with pytest.raises(ValueError, match="effort"):
         module.AGYClient(cwd=str(tmp_path), effort="ultra")
