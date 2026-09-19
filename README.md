@@ -1,217 +1,207 @@
-# Hermes AGY provider plugin
+# agybridge
 
-This repository adds two Hermes Agent model-provider profiles for the AGY CLI:
-**AGY** (high effort) and **AGY Fast** (low effort). Hermes remains the owner of
-the conversation state, tool schemas, approvals, execution, logs, and tool
-results. AGY is a bounded text-only reasoning subprocess.
+Universal, modular cross-platform reasoning bridge for the **AGY CLI** (Antigravity).
 
-## Security model
+`agybridge` decouples the external bounded AGY subprocess reasoning engine from specific host environments, exposing high-effort and low-effort reasoning capabilities to:
 
-The provider always starts AGY with `--mode plan --sandbox` and disables slash
-commands. It passes no shell command string: every option is an argv element.
-The prompt itself is never an argument: it is written to AGY's stdin as one
-`--input-format stream-json` user message, so large conversations are not
-limited by the operating system's per-argument size cap (128 KiB on Linux).
-The child receives a small operating-system environment allowlist. Credential
-variables, including `GOOGLE_*`, `GEMINI_*`, and `AGY_*`, are not forwarded
-automatically. If an AGY installation needs a particular variable, pass its
-name explicitly with `HERMES_AGY_ENV_ALLOWLIST=NAME1,NAME2`.
+1. **Hermes Agent** – full backward compatibility via native model-provider shims,
+2. **OpenCode** – via a lightweight, zero-dependency local OpenAI-compatible HTTP server (`@opencode/ai/providers/openai-compatible`),
+3. **OpenClaw & any MCP Host** – via a universal Model Context Protocol (MCP) server exposing the `agy_reason` tool,
+4. **Orca ADE** – via an executable CLI wrapper (`agy-bridge-agent`) and Docker container variant.
 
-AGY cannot execute Hermes tools directly. Tool schemas are rendered into a
-delimited prompt by Hermes' public ACP bridge. The response is accepted only
-after the plugin validates the NDJSON envelope, tool name, call ID, exact JSON
-shape, argument object, size, duplicates, and `tool_choice`. A blocked AGY
-action gets one bounded retry with a generic instruction; a second denial
-fails closed and lets Hermes' normal fallback handle it.
+---
 
-Write mode is deliberately rejected, including inside a Git worktree. Allowing
-AGY's own edit tools would bypass Hermes approval gates and violate the host
-ownership model. Writes must be requested as Hermes tool calls.
+## Platform Support Matrix
+
+| Platform / Host    | Integration Type                                       | Key Capabilities                                                                                           |
+| ------------------ | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| **Hermes Agent**   | Native Provider Plugin (`plugins/model-providers/agy`) | Profiles `agy` (high) & `agy-fast` (low), strict tool bridging, persistent session pool, restart store     |
+| **OpenCode**       | OpenAI HTTP (`/v1/chat/completions`, `/v1/models`)     | Non-streaming & SSE streaming, bearer token auth, payload limit 8 MiB, session mapping via `X-AGY-Session` |
+| **OpenClaw / MCP** | Universal MCP Server (`agybridge mcp`)                 | Tool `agy_reason(prompt, effort, model, session_id)`, `stdio` and streamable SSE transport                 |
+| **Orca ADE**       | Executable CLI Agent Wrapper & Docker                  | Directly executable script `agy-bridge-agent`, containerized HTTP daemon                                   |
+
+---
+
+## Architecture
 
 ```mermaid
-flowchart LR
-    H[Hermes Agent] -->|messages + tool schemas| P[AGY provider]
-    P -->|argv: plan + sandbox, prompt via stdin| A[AGY CLI]
-    A -->|stream-json response| P
-    P -->|validated OpenAI-shaped response| H
-    H --> T[Hermes dispatcher]
-    T -->|approval, execution, result| H
-    H -->|tool result as untrusted data| P
+flowchart TD
+    subgraph Hosts["Supported Hosts & Consumers"]
+        H[Hermes Agent]
+        OC[OpenCode]
+        MC[OpenClaw / Claude / MCP]
+        OA[Orca ADE]
+    end
+
+    subgraph Adapters["Adapters Layer"]
+        A_H["adapters/hermes<br>(ACP Bridge)"]
+        A_HTTP["adapters/openai_http<br>(stdlib http.server)"]
+        A_MCP["adapters/mcp<br>(MCPServer)"]
+        A_OC["adapters/opencode<br>(config generator)"]
+        A_OA["adapters/orca<br>(launcher)"]
+    end
+
+    subgraph Core["Pure Python 3.11+ Core (agybridge)"]
+        ENG[engine.py: AGYClient]
+        PORTS[ports.py: Dependency Inversion]
+        PROC[process.py: Process Tree & Bounds]
+        SESS[session.py: Pool & Store]
+        PROTO[protocol.py: Stream-JSON Parser]
+        TC[toolcalls.py: Tool Call Validator]
+        SEC[security.py: Sandbox & Env Allowlist]
+    end
+
+    subgraph Engine["Execution Target"]
+        AGY["AGY CLI Subprocess<br>(--mode plan --sandbox --disable-slash-commands)"]
+    end
+
+    H --> A_H
+    OC --> A_HTTP
+    MC --> A_MCP
+    OA --> A_OA
+
+    A_H --> PORTS
+    A_HTTP --> PORTS
+    A_MCP --> ENG
+    A_OC -.-> A_HTTP
+    A_OA --> ENG
+
+    PORTS --> ENG
+    ENG --> PROC
+    ENG --> SESS
+    ENG --> PROTO
+    ENG --> TC
+    ENG --> SEC
+    PROC --> AGY
 ```
 
-## Persistent AGY sessions (prototype)
+---
 
-By default every request starts a new AGY process. Setting
-`HERMES_AGY_PERSISTENT=1` keeps finished AGY processes in a small in-memory
-pool instead, one per Hermes session. Only requests from the agent loop carry
-a session id (passed through `build_api_kwargs_extras`); auxiliary requests such
-as titles, compression, and session search never do, so they stay on one-shot
-processes. A request reuses an idle process only when its messages are an
-unchanged continuation of the conversation that process already holds: the
-previous request's messages match exactly, the next message is the assistant
-reply with the same tool-call IDs, and no new system message follows. Only the
-new messages are then sent to AGY.
+## Security and Sandbox Guarantees
 
-Anything else starts a fresh process: an edited or compressed history, a
-different model, effort, tool list, command, working directory or environment,
-or a new system message. A process is discarded, never reused, after a timeout,
-exit, oversized output, protocol error, or two denied actions, because AGY keeps
-running an unfinished turn and would merge it into the next one. The provider
-enforces its own turn deadline, so AGY's `--print-timeout` is set to one day.
+As documented in [`docs/AUDIT.md`](docs/AUDIT.md), `agybridge` enforces strict security invariants across all adapters:
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `HERMES_AGY_PERSISTENT` | off | enable the pool |
-| `HERMES_AGY_SESSION_IDLE_SECONDS` | `900` | kill a process idle this long |
-| `HERMES_AGY_MAX_SESSIONS` | `4` | idle processes kept; the least recently used goes first |
+1. **Subprocess Sandboxing:**
+   - Always launched with `--mode plan --sandbox --disable-slash-commands`.
+   - Never invoked through a shell (`shell=False`); strict argv list only.
+   - User prompts are fed solely through stdin (`--input-format stream-json`), bypassing the operating system per-argument size cap (128 KiB on Linux).
+2. **Environment Isolation:**
+   - Child processes receive a minimal allowlist (`PATH`, `HOME`, `LANG`, etc.).
+   - Credential variables (including `GOOGLE_*`, `GEMINI_*`, `AGY_*`) are NEVER forwarded automatically. Extra variables require explicit configuration via `HERMES_AGY_ENV_ALLOWLIST`.
+3. **Secret Redaction:**
+   - Diagnostic stderr output is scrubbed of API keys, bearer tokens, and credentials before logging or inclusion in exception messages.
+4. **Memory and Size Bounds:**
+   - Maximum stdout buffer: 8 MiB (fail-closed overflow detection).
+   - Maximum stderr buffer: 64 KiB tail buffer.
+   - Maximum prompt size: 4 MiB.
+   - Maximum tool argument size: 64 KiB.
+   - Maximum tool calls per turn: 16.
+5. **Zero-Dependency HTTP Server:**
+   - Implemented using standard library `http.server.ThreadingHTTPServer`.
+   - Binds strictly to `127.0.0.1` by default.
+   - Requires `Authorization: Bearer <token>`.
+   - Enforces 8 MiB hard limit on request body (`413 Payload Too Large`).
+   - Disallows CORS headers.
 
-When a session cannot continue in its process, that process is stopped at once
-rather than left idle.
-
-Each request logs `AGY session reused (turn N): …` or
-`AGY session started (<reason>)` at INFO level, which shows how often reuse
-actually happens. Idle processes exit on their own when Hermes exits, because
-their stdin closes.
-
-### Resuming after a restart
-
-A gateway restart drops every pooled process. After each completed turn the
-provider records the AGY conversation id for the Hermes session in
-`$HERMES_HOME/state/agy-conversations.json` (override with
-`HERMES_AGY_SESSION_STORE`; `off` disables it). The record holds ids and a
-SHA-256 digest of the history, never message content. When a session has no
-live process but its history continues the recorded one, a new process starts
-with `--conversation <id>` and receives only the new messages.
-
-A record is marked in flight while a turn runs; if the process dies mid-turn,
-AGY's conversation holds an unfinished turn and the record is not resumed. If
-AGY cannot resume the conversation, the same request retries once with the
-full prompt in a fresh process. Records older than seven days are dropped.
-
-## Reasoning effort
-
-AGY accepts `low`, `medium`, and `high`. The **AGY** profile defaults to `high`
-and **AGY Fast** to `low`. When Hermes sends a reasoning effort, it is mapped
-per request: `minimal`/`low` → `low`, `medium` → `medium`,
-`high`/`xhigh`/`max`/`ultra` → `high`, and reasoning turned off → `low`.
-
-AGY ties an effort suffix in a model id to that effort:
-`gemini-3.8-flash-high` runs only with `--effort high` and
-`gemini-3.8-flash-low` only with `low`, while `gemini-3.8-flash` accepts all
-three. Without a requested effort the suffix decides; when Hermes asks for a
-different one, the provider sends the bare model id with that effort.
-
-## Requirements and compatibility
-
-- Hermes Agent **0.21.2 or newer**, including `ProviderProfile.create_client`
-  and `agent.acp_openai_bridge`;
-- AGY CLI installed and authenticated using its upstream instructions;
-- Python 3.11 or newer.
-
-The implementation was exercised against the public Hermes 0.21.2 source and
-AGY CLI 1.2.2's documented command-line interface (`agy --version` and
-`agy --help`). CI never logs in to Gemini and never requires a live AGY call.
-
-The model defaults are `gemini-3.8-flash-high` and
-`gemini-3.8-flash-low`. They are passed through unchanged, so an AGY release
-with different model aliases can select those names explicitly in Hermes.
+---
 
 ## Installation
 
-From a checkout:
+### Standard Installation
 
 ```bash
-git clone https://github.com/tomaasz/hermes-agy-plugin.git
+git clone https://github.com/tomaasz/agybridge.git
+cd agybridge
+pip install .
+```
+
+### With MCP Support
+
+```bash
+pip install .[mcp]
+```
+
+### Hermes Agent Native Plugin Installation
+
+Copy or symlink the plugin into your Hermes installation:
+
+```bash
 mkdir -p ~/.hermes/plugins/model-providers
-cp -R hermes-agy-plugin/plugins/model-providers/agy \
-  ~/.hermes/plugins/model-providers/agy
+cp -R plugins/model-providers/agy ~/.hermes/plugins/model-providers/agy
 ```
 
-Hermes' plugin installer can also install the repository into its normal
-`$HERMES_HOME/plugins/` directory. Restart Hermes or start a new session after
-installing so provider discovery runs again.
+Existing configurations and profiles (`agy`, `agy-fast`) remain 100% backward compatible without changes.
 
-Select a profile in a new session:
+---
 
-```text
-/model gemini-3.8-flash-high --provider agy
-/model gemini-3.8-flash-low --provider agy-fast
-```
+## CLI Usage
 
-For a wrapper executable, set `HERMES_AGY_COMMAND` or `AGY_CLI_PATH`. The
-wrapper must be directly executable and contain any fixed arguments itself.
-Additional process arguments are rejected because even a positional argument
-could select an AGY subcommand before the sandbox and plan-mode flags.
+The package installs the `agybridge` CLI executable:
 
-## Request flow and fallback
-
-The provider starts one AGY process per Hermes completion. It accepts exactly
-one `event=result` object in `stream-json`; malformed lines, missing or
-multiple result events, empty responses, non-zero exits, output over 8 MiB,
-invalid UTF-8, and timeouts are errors. The request timeout covers the initial
-attempt and the optional denial retry together. A timeout sends SIGTERM, waits
-briefly, then sends SIGKILL if needed. Closing the client stops every active
-child. Stderr is bounded and secrets in diagnostics are redacted.
-
-`stream=True` returns the standard two-chunk OpenAI-compatible shape used by
-Hermes: a data chunk followed by a usage chunk. Usage is mapped from either
-`prompt_tokens`/`completion_tokens` or `input_tokens`/`output_tokens` when AGY
-provides it.
-
-If AGY returns a denied internal action, the plugin retries once. The retry
-does not echo the action name or any AGY output. A second denial raises a
-provider error, allowing Hermes' configured provider fallback to take over.
-
-## Development and tests
-
-The suite uses a real subprocess stub, never a live model:
+### 1. Run OpenAI-Compatible HTTP Server (for OpenCode)
 
 ```bash
-python -m pytest -q -o 'addopts=' tests/test_agy_provider.py
-python -m py_compile plugins/model-providers/agy/__init__.py \
-  plugins/model-providers/agy/client.py
-ruff check plugins tests
-ruff format --check plugins tests
-git diff --check
+# Start server on default 127.0.0.1:8791 with token authentication
+agybridge serve --port 8791 --token my-secret-token
+
+# Or configure via environment variable
+export AGYBRIDGE_TOKEN="my-secret-token"
+agybridge serve
 ```
 
-Tests cover both profiles, model/effort forwarding, read-only flags, write
-rejection, schema forwarding, valid and multiple calls, malformed wrappers and
-JSON, missing or duplicate IDs, unknown tools, argument and prompt limits,
-`tool_choice` modes, empty/partial/multiple-result streams, split Unicode
-NDJSON, usage, process failures, redaction, timeout cleanup, denied retries,
-environment isolation, shell-injection resistance, and prompt-injection
-attempts in tool results. They also verify a shared retry deadline, invalid
-UTF-8 rejection, and cleanup of concurrent subprocesses.
+Generate OpenCode configuration snippet:
 
-## Troubleshooting
+```bash
+agybridge config opencode --base-url http://127.0.0.1:8791/v1 --token my-secret-token
+```
 
-- **Provider is missing:** verify Hermes is 0.21.2+ and that the directory is
-  under `$HERMES_HOME/plugins/model-providers/agy`; restart the session.
-- **CLI not found:** run `agy --version`, then set `AGY_CLI_PATH` to the
-  executable selected by your installation.
-- **Authentication failure:** authenticate AGY with its upstream CLI. Hermes
-  does not read or store AGY credentials.
-- **Timeout or output-limit error:** use a smaller request or configure the
-  provider timeout in Hermes; inspect the AGY CLI independently with a simple
-  non-interactive prompt.
-- **Tool call rejected:** the call must use exactly
-  `<tool_call>{"id":"...","type":"function","function":{"name":"...","arguments":"{...}"}}</tool_call>`
-  and the name must be one of the Hermes schemas in that turn.
+### 2. Run MCP Server (for OpenClaw / Claude Desktop)
 
-## Limitations
+```bash
+# Run over standard I/O (default)
+agybridge mcp
 
-AGY is text-only in this adapter; image content is represented by a placeholder.
-There is no live model catalog, parallel subprocess mode, telemetry, or
-automatic credential forwarding. The adapter does not modify Hermes core and
-does not grant AGY a terminal, filesystem, browser, network, or independent
-tool executor.
+# Run over SSE transport
+agybridge mcp --transport sse --port 8792
+```
 
-## Reporting problems
+### 3. Install Orca ADE Agent Wrapper
 
-Please include the Hermes version, AGY version, selected profile, sanitized
-error text, and a minimal reproducible stream-json fixture. Never include
-tokens, cookies, credentials, private paths, or full tool-result contents.
+```bash
+agybridge orca install
+# Installs directly executable wrapper to ~/.local/bin/agy-bridge-agent
+```
+
+---
+
+## Persistent Sessions and Resumption
+
+When `HERMES_AGY_PERSISTENT=1` (or `X-AGY-Session` header is provided in HTTP requests):
+
+- Completed AGY processes are kept in an idle pool (up to `HERMES_AGY_MAX_SESSIONS`, default: 4).
+- Subsequent requests with matching history continue in the existing process, sending only conversation deltas.
+- On process restart or gateway reboot, resumable AGY conversation IDs are recovered from `~/.hermes/state/agy-conversations.json` (SHA-256 history digest, no raw message contents).
+
+---
+
+## Testing and Verification
+
+Run the test suite (70 tests covering baseline regression, core modules, HTTP server, MCP, and integrations):
+
+```bash
+pytest -v
+```
+
+Verification covers:
+
+- Untouched baseline regression test suite (`tests/test_agy_provider.py`, 37 tests),
+- Backward-compatibility import shims (`tests/test_backcompat_imports.py`),
+- Core execution, process tree SIGTERM/SIGKILL, buffer limits, and security allowlists (`tests/core/`),
+- OpenAI HTTP streaming SSE, auth gates, 8 MiB limits, and Hermes-HTTP response parity (`tests/adapters/test_openai_http.py`),
+- MCP tool definition and execution (`tests/adapters/test_mcp.py`),
+- OpenCode config generator and Orca launcher (`tests/adapters/test_opencode.py`, `tests/adapters/test_orca.py`).
+
+---
 
 ## License
 

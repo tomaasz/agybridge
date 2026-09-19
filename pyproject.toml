@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agybridge"
+version = "0.3.0"
+description = "Universal modular AGY reasoning bridge for Hermes, OpenCode, MCP, and Orca ADE"
+readme = "README.md"
+authors = [{ name = "hermes-agy-plugin contributors" }]
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/tomaasz/agybridge"
+Repository = "https://github.com/tomaasz/agybridge"
+
+[project.optional-dependencies]
+mcp = ["mcp>=2.0.0"]
+dev = ["pytest>=8.0.0"]
+
+[project.scripts]
+agybridge = "agybridge.cli:main"
+agybridge-serve = "adapters.openai_http.server:main"
+agybridge-mcp = "adapters.mcp.server:main"
+
+[tool.setuptools]
+package-dir = { "" = "core", "adapters" = "adapters" }
+
+[tool.setuptools.packages.find]
+where = ["core", "."]
+include = ["agybridge*", "adapters*"]

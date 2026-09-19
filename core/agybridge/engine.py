@@ -1,0 +1,503 @@
+"""Core OpenAI-compatible engine facade over AGY CLI."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import math
+import os
+import subprocess
+import threading
+import time
+from collections.abc import Iterable, Mapping
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+from .backends.agy import AGY_EFFORTS, DEFAULT_BACKEND, agy_effort
+from .backends.base import CliBackend
+from .ports import DEFAULT_PORTS, BridgePorts
+from .process import run_process, stop_process
+from .prompt import (
+    _DELTA_HEADER,
+    _DENIED_RETRY,
+    TEXT_ONLY_CONTRACT,
+    TOOL_BRIDGE_CONTRACT,
+    _normalize_messages,
+    render_prompt,
+)
+from .protocol import (
+    AGYProcessError,
+    AGYProtocolError,
+    AGYTimeoutError,
+    ParsedOutput,
+)
+from .security import (
+    DEFAULT_MAX_ARGUMENT_BYTES,
+    DEFAULT_MAX_PROMPT_BYTES,
+    DEFAULT_MAX_STDERR_BYTES,
+    DEFAULT_MAX_STDOUT_BYTES,
+    DEFAULT_MAX_TOOL_CALLS,
+    DEFAULT_MODEL,
+    DEFAULT_TIMEOUT_SECONDS,
+    _positive_int,
+    _positive_number,
+    _redact,
+    _safe_child_env,
+)
+from .session import (
+    POOL,
+    PRINT_TIMEOUT,
+    STORE,
+    AGYSession,
+    SessionDied,
+    SessionOverflow,
+    SessionTimeout,
+    persistent_enabled,
+)
+from .toolcalls import _TOOL_OPEN, _strict_tool_calls, _tool_policy
+
+SESSION_ID_FIELD = "hermes_session_id"
+
+logger = logging.getLogger(__name__)
+
+
+class AGYClient:
+    """OpenAI-shaped client running bounded AGY subprocess turns."""
+
+    HERMES_SKIP_TRANSPORT_WRAP = True
+    HERMES_SKIP_ASYNC_WRAP = True
+
+    def __init__(
+        self,
+        *,
+        command: str = "agy",
+        args: list[str] | None = None,
+        cwd: str | None = None,
+        acp_cwd: str | None = None,
+        write: bool = False,
+        timeout: Any = DEFAULT_TIMEOUT_SECONDS,
+        effort: str = "high",
+        default_model: str = DEFAULT_MODEL,
+        max_stdout_bytes: int = DEFAULT_MAX_STDOUT_BYTES,
+        max_stderr_bytes: int = DEFAULT_MAX_STDERR_BYTES,
+        max_prompt_bytes: int = DEFAULT_MAX_PROMPT_BYTES,
+        max_argument_bytes: int = DEFAULT_MAX_ARGUMENT_BYTES,
+        max_tool_calls: int = DEFAULT_MAX_TOOL_CALLS,
+        env_allowlist: Iterable[str] = (),
+        terminate_grace: float = 2.0,
+        persistent: bool | None = None,
+        ports: BridgePorts | None = None,
+        backend: CliBackend | None = None,
+        **_: Any,
+    ) -> None:
+        if effort not in AGY_EFFORTS:
+            raise ValueError("AGY effort must be one of: low, medium, high")
+        if write:
+            raise ValueError(
+                "AGY write mode is disabled: Hermes must authorize and execute every write"
+            )
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("AGY command must be a non-empty executable name")
+        if args:
+            raise ValueError(
+                "AGY process args are disabled because they can select a subcommand before the sandbox flags; use a wrapper executable instead"
+            )
+        workdir = Path(acp_cwd or cwd or os.getcwd()).expanduser().resolve()
+        if not workdir.is_dir():
+            raise ValueError("AGY cwd must be an existing directory")
+        if not isinstance(default_model, str) or not default_model.strip():
+            raise ValueError("AGY default model must be non-empty")
+
+        self.command = command.strip()
+        self.cwd = str(workdir)
+        self.timeout = _positive_number(
+            timeout, DEFAULT_TIMEOUT_SECONDS, label="AGY timeout"
+        )
+        self.terminate_grace = _positive_number(
+            terminate_grace, 2.0, label="AGY terminate grace"
+        )
+        self.effort = effort
+        self.default_model = default_model.strip()
+        self.max_stdout_bytes = _positive_int(
+            max_stdout_bytes, DEFAULT_MAX_STDOUT_BYTES, label="max_stdout_bytes"
+        )
+        self.max_stderr_bytes = _positive_int(
+            max_stderr_bytes, DEFAULT_MAX_STDERR_BYTES, label="max_stderr_bytes"
+        )
+        self.max_prompt_bytes = _positive_int(
+            max_prompt_bytes, DEFAULT_MAX_PROMPT_BYTES, label="max_prompt_bytes"
+        )
+        self.max_argument_bytes = _positive_int(
+            max_argument_bytes, DEFAULT_MAX_ARGUMENT_BYTES, label="max_argument_bytes"
+        )
+        self.max_tool_calls = _positive_int(
+            max_tool_calls, DEFAULT_MAX_TOOL_CALLS, label="max_tool_calls"
+        )
+        configured_allowlist = os.environ.get("HERMES_AGY_ENV_ALLOWLIST", "").split(",")
+        self._child_env = _safe_child_env([*configured_allowlist, *env_allowlist])
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+        self.is_closed = False
+        self._active_processes: set[subprocess.Popen[bytes]] = set()
+        self._process_lock = threading.Lock()
+        self.persistent = (
+            persistent_enabled() if persistent is None else bool(persistent)
+        )
+        self._active_sessions: set[AGYSession] = set()
+        self.ports = ports or DEFAULT_PORTS
+        self.backend = backend or DEFAULT_BACKEND
+
+    def close(self) -> None:
+        """Stop an in-flight child; safe to call more than once."""
+        with self._process_lock:
+            self.is_closed = True
+            processes = tuple(self._active_processes)
+            self._active_processes.clear()
+            sessions = tuple(self._active_sessions)
+            self._active_sessions.clear()
+        for process in processes:
+            stop_process(process, self.terminate_grace)
+        for session in sessions:
+            session.stop()
+
+    def _oneshot_turn(
+        self, model: str, effort: str, prompt: str, effective_timeout: float
+    ) -> ParsedOutput:
+        request_deadline = time.monotonic() + effective_timeout
+        current_prompt = prompt
+        for attempt in range(2):
+            remaining = request_deadline - time.monotonic()
+            if remaining <= 0:
+                raise AGYTimeoutError(
+                    f"AGY exceeded the {effective_timeout:g}s request timeout"
+                )
+            argv = self.backend.build_argv(
+                self.command, model, f"{max(1, math.ceil(remaining))}s", effort
+            )
+            stdin_bytes = self.backend.format_stdin(current_prompt)
+
+            def on_start(proc: subprocess.Popen[bytes]) -> None:
+                with self._process_lock:
+                    if not self.is_closed:
+                        self._active_processes.add(proc)
+
+            def on_done(proc: subprocess.Popen[bytes]) -> None:
+                with self._process_lock:
+                    self._active_processes.discard(proc)
+
+            stdout, _stderr = run_process(
+                argv,
+                cwd=self.cwd,
+                env=self._child_env,
+                timeout=remaining,
+                max_stdout_bytes=self.max_stdout_bytes,
+                max_stderr_bytes=self.max_stderr_bytes,
+                terminate_grace=self.terminate_grace,
+                stdin_data=stdin_bytes,
+                is_closed=lambda: self.is_closed,
+                on_process_start=on_start,
+                on_process_done=on_done,
+            )
+            parsed = self.backend.parse_output(stdout)
+            if (
+                not parsed.denied
+                or _TOOL_OPEN in parsed.text
+                or (attempt > 0 and bool(parsed.text.strip()))
+            ):
+                return parsed
+            if attempt == 0:
+                current_prompt = prompt + "\n\n" + _DENIED_RETRY
+        raise AGYProcessError(
+            "AGY attempted an internal action twice; Hermes fallback is required"
+        )
+
+    def _persistent_turn(
+        self,
+        model: str,
+        effort: str,
+        session_id: str,
+        contract: str,
+        tool_sections: list[str],
+        normalized: list[dict[str, Any]],
+        prompt: str,
+        effective_timeout: float,
+    ) -> tuple[ParsedOutput, AGYSession]:
+        deadline = time.monotonic() + effective_timeout
+        fingerprint = hashlib.sha256(
+            "\0".join([contract, *tool_sections]).encode("utf-8")
+        ).hexdigest()
+        key = (
+            session_id,
+            (
+                self.command,
+                self.cwd,
+                tuple(sorted(self._child_env.items())),
+                model,
+                effort,
+                fingerprint,
+            ),
+        )
+        compat = hashlib.sha256(repr(key[1]).encode("utf-8")).hexdigest()
+        prompt_bytes = len(prompt.encode("utf-8"))
+        session, delta, reason = POOL.checkout(key, normalized)
+        resumed_from: str | None = None
+        if session is not None and delta is not None:
+            content = _DELTA_HEADER + json.dumps(
+                delta, ensure_ascii=False, separators=(",", ":")
+            )
+            logger.info(
+                "AGY session reused (turn %d): %d new message(s), %d of %d prompt bytes",
+                session.turns + 1,
+                len(delta),
+                len(content.encode("utf-8")),
+                prompt_bytes,
+            )
+            STORE.mark_in_flight(session_id)
+        else:
+            resume = STORE.resume_point(session_id, compat, normalized)
+            if resume is not None:
+                resumed_from, delta = resume
+                content = _DELTA_HEADER + json.dumps(
+                    delta, ensure_ascii=False, separators=(",", ":")
+                )
+                session = self._start_session(key, model, effort, resumed_from)
+                logger.info(
+                    "AGY session resumed (conversation %s): %d new message(s), %d of %d prompt bytes",
+                    resumed_from,
+                    len(delta),
+                    len(content.encode("utf-8")),
+                    prompt_bytes,
+                )
+                STORE.mark_in_flight(session_id)
+            else:
+                STORE.forget(session_id)
+                session = self._start_session(key, model, effort, None)
+                content = prompt
+                logger.info("AGY session started (%s)", reason)
+        session.store_key = (session_id, compat)
+        try:
+            return (
+                self._drive_session(session, content, deadline, effective_timeout),
+                session,
+            )
+        except AGYProcessError:
+            if resumed_from is None:
+                STORE.forget(session_id)
+                raise
+            logger.warning(
+                "AGY conversation %s could not be resumed; starting a fresh one",
+                resumed_from,
+            )
+        except BaseException:
+            STORE.forget(session_id)
+            raise
+        STORE.forget(session_id)
+        session = self._start_session(key, model, effort, None)
+        session.store_key = (session_id, compat)
+        try:
+            return (
+                self._drive_session(session, prompt, deadline, effective_timeout),
+                session,
+            )
+        except BaseException:
+            STORE.forget(session_id)
+            raise
+
+    def _start_session(
+        self,
+        key: tuple[Any, ...],
+        model: str,
+        effort: str,
+        conversation_id: str | None,
+    ) -> AGYSession:
+        argv = self.backend.build_argv(
+            self.command, model, PRINT_TIMEOUT, effort, conversation_id
+        )
+        try:
+            return AGYSession(
+                key,
+                argv,
+                cwd=self.cwd,
+                env=self._child_env,
+                max_stderr_bytes=self.max_stderr_bytes,
+                terminate_grace=self.terminate_grace,
+            )
+        except FileNotFoundError as exc:
+            raise AGYProcessError(
+                f"AGY executable {Path(self.command).name!r} was not found"
+            ) from exc
+        except OSError as exc:
+            raise AGYProcessError(
+                f"AGY executable {Path(self.command).name!r} could not be started"
+            ) from exc
+
+    def _drive_session(
+        self,
+        session: AGYSession,
+        content: str,
+        deadline: float,
+        effective_timeout: float,
+    ) -> ParsedOutput:
+        with self._process_lock:
+            closed = self.is_closed
+            if not closed:
+                self._active_sessions.add(session)
+        if closed:
+            session.stop()
+            raise AGYProcessError("AGY client is closed")
+        succeeded = False
+        try:
+            for attempt in range(2):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AGYTimeoutError(
+                        f"AGY exceeded the {effective_timeout:g}s request timeout"
+                    )
+                try:
+                    stdout = session.run_turn(content, remaining, self.max_stdout_bytes)
+                except SessionTimeout as exc:
+                    raise AGYTimeoutError(
+                        f"AGY exceeded the {effective_timeout:g}s request timeout"
+                    ) from exc
+                except SessionOverflow as exc:
+                    raise AGYProtocolError(
+                        f"AGY stdout exceeded the {self.max_stdout_bytes}-byte limit"
+                    ) from exc
+                except SessionDied as exc:
+                    tail = _redact(exc.stderr_tail).strip()
+                    detail = f": {tail}" if tail else ""
+                    raise AGYProcessError(
+                        f"AGY session exited with status {exc.returncode}{detail}"
+                    ) from exc
+                parsed = self.backend.parse_output(stdout)
+                if (
+                    not parsed.denied
+                    or _TOOL_OPEN in parsed.text
+                    or (attempt > 0 and bool(parsed.text.strip()))
+                ):
+                    succeeded = True
+                    return parsed
+                if attempt == 0:
+                    content = _DENIED_RETRY
+            raise AGYProcessError(
+                "AGY attempted an internal action twice; Hermes fallback is required"
+            )
+        finally:
+            with self._process_lock:
+                self._active_sessions.discard(session)
+            if not succeeded:
+                session.stop()
+
+    def _create(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        stream: bool = False,
+        timeout: Any = None,
+        reasoning_effort: Any = None,
+        extra_body: Any = None,
+        **_: Any,
+    ) -> Any:
+        with self._process_lock:
+            if self.is_closed:
+                raise AGYProcessError("AGY client is closed")
+        selected_model = (model or self.default_model).strip()
+        if not selected_model:
+            raise ValueError("AGY model must be non-empty")
+        effective_timeout = _positive_number(
+            timeout, self.timeout, label="AGY request timeout"
+        )
+        policy = _tool_policy(tools, tool_choice)
+        tool_sections = self.ports.tool_schema_renderer(
+            policy.tools, tool_choice if tool_choice not in (None, "none") else None
+        )
+        contract = TOOL_BRIDGE_CONTRACT if policy.tools else TEXT_ONLY_CONTRACT
+        normalized = _normalize_messages(messages)
+        conversation = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+        prompt = render_prompt(contract, tool_sections, conversation)
+        if len(prompt.encode("utf-8")) > self.max_prompt_bytes:
+            raise AGYProtocolError(
+                f"Hermes prompt exceeds the {self.max_prompt_bytes}-byte AGY limit"
+            )
+        agy_model, effort = self.backend.map_model_and_effort(
+            selected_model, agy_effort(reasoning_effort), self.effort
+        )
+        session_id = (
+            extra_body.get(SESSION_ID_FIELD)
+            if isinstance(extra_body, Mapping)
+            else None
+        )
+        session: AGYSession | None = None
+        if self.persistent and isinstance(session_id, str) and session_id.strip():
+            parsed, session = self._persistent_turn(
+                agy_model,
+                effort,
+                session_id.strip(),
+                contract,
+                tool_sections,
+                normalized,
+                prompt,
+                effective_timeout,
+            )
+        else:
+            parsed = self._oneshot_turn(agy_model, effort, prompt, effective_timeout)
+        try:
+            if len(parsed.text.encode("utf-8")) > self.max_stdout_bytes:
+                raise AGYProtocolError(
+                    "AGY response text exceeds the configured size limit"
+                )
+            tool_calls, clean_text = _strict_tool_calls(
+                parsed.text,
+                policy,
+                max_argument_bytes=self.max_argument_bytes,
+                max_tool_calls=self.max_tool_calls,
+                tool_call_factory=self.ports.tool_call_factory,
+            )
+            if not tool_calls and not clean_text:
+                raise AGYProtocolError("AGY returned an empty response")
+        except BaseException:
+            if session is not None:
+                session.stop()
+                if session.store_key is not None:
+                    STORE.forget(session.store_key[0])
+            raise
+        if session is not None:
+            session.history = normalized
+            session.reply_ids = tuple(call.id for call in tool_calls)
+            if self.is_closed:
+                session.stop()
+            else:
+                POOL.checkin(session)
+            if session.store_key is not None and session.conversation_id:
+                STORE.record(
+                    session.store_key[0],
+                    conversation_id=session.conversation_id,
+                    compat=session.store_key[1],
+                    history=normalized,
+                    reply_ids=session.reply_ids,
+                )
+        usage = SimpleNamespace(
+            **parsed.usage, prompt_tokens_details=SimpleNamespace(cached_tokens=0)
+        )
+        message = SimpleNamespace(
+            content=clean_text,
+            tool_calls=tool_calls,
+            reasoning=None,
+            reasoning_content=None,
+            reasoning_details=None,
+        )
+        completion = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=message,
+                    finish_reason="tool_calls" if tool_calls else "stop",
+                )
+            ],
+            usage=usage,
+            model=selected_model,
+        )
+        return self.ports.stream_codec(completion) if stream else completion

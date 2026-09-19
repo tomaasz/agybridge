@@ -1,0 +1,22 @@
+[Unit]
+Description=agybridge Local OpenAI-Compatible AGY Bridge Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/agybridge serve --host 127.0.0.1 --port 8791
+Restart=on-failure
+RestartSec=5s
+Environment=PYTHONUNBUFFERED=1
+# Uncomment to enforce static auth token:
+# Environment="AGYBRIDGE_TOKEN=your-secret-token"
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
+

@@ -1,9 +1,9 @@
 name: agy-provider
 kind: model-provider
-version: 0.2.0
+version: 0.3.0
 description: Secure AGY external-process provider with Hermes-mediated tool calls
 author: hermes-agy-plugin contributors
 license: MIT
-homepage: https://github.com/tomaasz/hermes-agy-plugin
+homepage: https://github.com/tomaasz/agybridge
 requires_hermes: ">=0.21.2"
 tags: [agy, model-provider, external-process]
