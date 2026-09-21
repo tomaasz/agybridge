@@ -932,6 +932,57 @@ def test_persistent_denied_retry_stays_in_the_same_session(
     assert second["content"] == module.client._DENIED_RETRY
 
 
+def test_persistent_rejected_reply_is_repaired_in_the_same_session(
+    monkeypatch, tmp_path, request
+):
+    module = _load_plugin(monkeypatch)
+    bad = '<tool_call>{"id":"x","type":"function","function":{"name":"read_file","arguments":"{bad}"}}</tool_call>'
+    stub, log, spawns = _session_stub(tmp_path, [bad, _call(), "", "", "later"])
+    client = _session_client(module, tmp_path, stub, request)
+    history = [{"role": "user", "content": "read it"}]
+    result = client.chat.completions.create(messages=history, tools=[_tool()])
+    first, repair = _turns(log)
+    assert result.choices[0].message.tool_calls[0].id == "call_1"
+    assert _spawn_count(spawns) == 1 and first["pid"] == repair["pid"]
+    assert repair["content"].startswith("Hermes rejected your previous reply")
+    assert "not valid JSON" in repair["content"]
+
+    # The repaired reply is what the session remembers, so the next turn is a delta.
+    history += [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "body"},
+    ]
+    with pytest.raises(module.AGYProtocolError, match="empty"):
+        client.chat.completions.create(messages=history, tools=[_tool()])
+    assert _turns(log)[2]["content"].startswith("HERMES_CONVERSATION_DELTA_JSON")
+    assert _turns(log)[3]["content"].startswith("Hermes rejected")
+    with pytest.raises(ProcessLookupError):  # a second rejection drops the session
+        os.kill(first["pid"], 0)
+
+
+def test_client_exposes_base_url_and_resolves_empty_command(monkeypatch, tmp_path):
+    module = _load_plugin(monkeypatch)
+    monkeypatch.delenv("AGY_CLI_PATH", raising=False)
+    monkeypatch.setenv("HERMES_AGY_COMMAND", "/opt/agy")
+    client = module.AGYClient(command="", cwd=str(tmp_path))
+    assert client.command == "/opt/agy" and client.base_url == "acp://agy"
+    monkeypatch.delenv("HERMES_AGY_COMMAND")
+    assert module.AGYClient(command=None, cwd=str(tmp_path)).command == "agy"
+    assert module.agy_fast.create_client(cwd=str(tmp_path)).base_url == "acp://agy-fast"
+    with pytest.raises(ValueError, match="command"):
+        module.AGYClient(command=42, cwd=str(tmp_path))
+
+
 def test_persistent_mode_is_opt_in_and_idle_sessions_expire(
     monkeypatch, tmp_path, request
 ):

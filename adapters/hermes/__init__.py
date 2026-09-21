@@ -49,6 +49,8 @@ class AGYProfile(ProviderProfile):
 
     def create_client(self, **kwargs: Any) -> HermesAGYClient:
         """Use AGY's stream-json process instead of an HTTP client."""
+        if not kwargs.get("base_url"):
+            kwargs["base_url"] = getattr(self, "base_url", None)
         return HermesAGYClient(
             effort=self.effort, default_model=self.default_model, **kwargs
         )

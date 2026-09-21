@@ -22,6 +22,7 @@ from .process import run_process, stop_process
 from .prompt import (
     _DELTA_HEADER,
     _DENIED_RETRY,
+    _REPAIR_RETRY,
     TEXT_ONLY_CONTRACT,
     TOOL_BRIDGE_CONTRACT,
     _normalize_messages,
@@ -59,6 +60,8 @@ from .session import (
 from .toolcalls import _TOOL_OPEN, _strict_tool_calls, _tool_policy
 
 SESSION_ID_FIELD = "hermes_session_id"
+DEFAULT_BASE_URL = "acp://agy"
+COMMAND_ENV_VARS = ("HERMES_AGY_COMMAND", "AGY_CLI_PATH")
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +75,7 @@ class AGYClient:
     def __init__(
         self,
         *,
-        command: str = "agy",
+        command: str | None = None,
         args: list[str] | None = None,
         cwd: str | None = None,
         acp_cwd: str | None = None,
@@ -90,8 +93,16 @@ class AGYClient:
         persistent: bool | None = None,
         ports: BridgePorts | None = None,
         backend: CliBackend | None = None,
+        base_url: Any = None,
+        api_key: Any = None,
         **_: Any,
     ) -> None:
+        if command is None or (isinstance(command, str) and not command.strip()):
+            # Hermes passes an empty command when it cannot resolve one itself.
+            command = next(
+                (os.environ[name] for name in COMMAND_ENV_VARS if os.environ.get(name)),
+                "agy",
+            )
         if effort not in AGY_EFFORTS:
             raise ValueError("AGY effort must be one of: low, medium, high")
         if write:
@@ -111,6 +122,9 @@ class AGYClient:
             raise ValueError("AGY default model must be non-empty")
 
         self.command = command.strip()
+        # Hermes reads these when it switches to this client as a fallback.
+        self.base_url = str(base_url or DEFAULT_BASE_URL)
+        self.api_key = api_key if isinstance(api_key, str) else ""
         self.cwd = str(workdir)
         self.timeout = _positive_number(
             timeout, DEFAULT_TIMEOUT_SECONDS, label="AGY timeout"
@@ -389,6 +403,24 @@ class AGYClient:
             if not succeeded:
                 session.stop()
 
+    def _validate_reply(
+        self, parsed: ParsedOutput, policy: Any
+    ) -> tuple[list[Any], str]:
+        if len(parsed.text.encode("utf-8")) > self.max_stdout_bytes:
+            raise AGYProtocolError(
+                "AGY response text exceeds the configured size limit"
+            )
+        tool_calls, clean_text = _strict_tool_calls(
+            parsed.text,
+            policy,
+            max_argument_bytes=self.max_argument_bytes,
+            max_tool_calls=self.max_tool_calls,
+            tool_call_factory=self.ports.tool_call_factory,
+        )
+        if not tool_calls and not clean_text:
+            raise AGYProtocolError("AGY returned an empty response")
+        return tool_calls, clean_text
+
     def _create(
         self,
         *,
@@ -431,6 +463,7 @@ class AGYClient:
             if isinstance(extra_body, Mapping)
             else None
         )
+        deadline = time.monotonic() + effective_timeout
         session: AGYSession | None = None
         if self.persistent and isinstance(session_id, str) and session_id.strip():
             parsed, session = self._persistent_turn(
@@ -446,19 +479,23 @@ class AGYClient:
         else:
             parsed = self._oneshot_turn(agy_model, effort, prompt, effective_timeout)
         try:
-            if len(parsed.text.encode("utf-8")) > self.max_stdout_bytes:
-                raise AGYProtocolError(
-                    "AGY response text exceeds the configured size limit"
+            try:
+                tool_calls, clean_text = self._validate_reply(parsed, policy)
+            except AGYProtocolError as exc:
+                if session is None:
+                    raise
+                # A live session keeps the conversation, so asking AGY to fix its
+                # reply costs one short turn instead of a cold full-prompt retry.
+                logger.warning(
+                    "AGY reply rejected (%s); asking for a corrected one", exc
                 )
-            tool_calls, clean_text = _strict_tool_calls(
-                parsed.text,
-                policy,
-                max_argument_bytes=self.max_argument_bytes,
-                max_tool_calls=self.max_tool_calls,
-                tool_call_factory=self.ports.tool_call_factory,
-            )
-            if not tool_calls and not clean_text:
-                raise AGYProtocolError("AGY returned an empty response")
+                parsed = self._drive_session(
+                    session,
+                    _REPAIR_RETRY.format(error=exc),
+                    deadline,
+                    effective_timeout,
+                )
+                tool_calls, clean_text = self._validate_reply(parsed, policy)
         except BaseException:
             if session is not None:
                 session.stop()

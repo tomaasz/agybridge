@@ -23,6 +23,12 @@ _DENIED_RETRY = (
     "Continue by emitting a valid Hermes <tool_call> from the supplied schemas, or return a textual "
     "explanation if no tool is allowed."
 )
+_REPAIR_RETRY = (
+    "Hermes rejected your previous reply: {error}. Reply again in full. Return either plain text, "
+    'or <tool_call>{{"id":"call_1","type":"function","function":{{"name":"<listed tool>",'
+    '"arguments":"<JSON object encoded as a string>"}}}}</tool_call> blocks with no other keys, '
+    "each opened and closed exactly once, never nested."
+)
 _DELTA_HEADER = (
     "HERMES_CONVERSATION_DELTA_JSON: new messages appended to the Hermes conversation you already "
     "hold, after your previous reply. The contract and tool list from the first message still "
