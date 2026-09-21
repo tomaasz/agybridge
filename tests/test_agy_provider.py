@@ -970,6 +970,80 @@ def test_persistent_rejected_reply_is_repaired_in_the_same_session(
         os.kill(first["pid"], 0)
 
 
+def test_warm_spare_serves_the_next_new_conversation(monkeypatch, tmp_path, request):
+    module = _load_plugin(monkeypatch)
+    monkeypatch.setenv("HERMES_AGY_WARM_SPARE", "1")
+    stub, log, _ = _session_stub(tmp_path, ["first", "second"])
+    client = _session_client(module, tmp_path, stub, request)
+    client.chat.completions.create(messages=[{"role": "user", "content": "hi"}])
+    pool = module.client.POOL
+    deadline = time.monotonic() + 5
+    while not pool._spares and time.monotonic() < deadline:
+        time.sleep(0.02)
+    (spare,) = pool._spares.values()
+    spare_pid = spare.process.pid
+    create = client.chat.completions.create
+    result = create(
+        messages=[{"role": "user", "content": "other chat"}],
+        extra_body={"hermes_session_id": "s2"},
+    )
+    assert result.choices[0].message.content == "second"
+    assert _turns(log)[1]["pid"] == spare_pid
+    assert "HERMES_CONVERSATION_JSON" in _turns(log)[1]["content"]
+    deadline = time.monotonic() + 5
+    while not pool._spares and time.monotonic() < deadline:
+        time.sleep(0.02)
+    (replacement,) = (item.process.pid for item in pool._spares.values())
+    assert replacement != spare_pid
+    pool.clear()
+    with pytest.raises(ProcessLookupError):
+        os.kill(replacement, 0)
+
+
+def test_warm_spare_is_opt_in(monkeypatch, tmp_path, request):
+    module = _load_plugin(monkeypatch)
+    monkeypatch.delenv("HERMES_AGY_WARM_SPARE", raising=False)
+    stub, _log, spawns = _session_stub(tmp_path, ["first"])
+    client = _session_client(module, tmp_path, stub, request)
+    client.chat.completions.create(messages=[{"role": "user", "content": "hi"}])
+    time.sleep(0.3)
+    assert _spawn_count(spawns) == 1
+
+
+def test_request_timing_is_logged_with_agy_durations(monkeypatch, tmp_path, caplog):
+    module = _load_plugin(monkeypatch)
+    events = [
+        {
+            "event": "step_update",
+            "step_update": {"step_type": "agent_response", "duration_seconds": 1.25},
+        },
+        {
+            "event": "step_update",
+            "step_update": {"step_type": "agent_response", "duration_seconds": 0.5},
+        },
+        {
+            "event": "result",
+            "result": {
+                "response": "ok",
+                "duration_seconds": 19.5,
+                "usage": {"input_tokens": 17},
+            },
+        },
+    ]
+    parsed = module.client._parse_stream_json(
+        "\n".join(json.dumps(event) for event in events).encode()
+    )
+    assert (parsed.agy_seconds, parsed.model_seconds) == (19.5, 1.75)
+    stub = _write_stub(tmp_path, events=events)
+    with caplog.at_level("INFO", logger="agybridge.engine"):
+        _client(module, tmp_path, stub).chat.completions.create(messages=[])
+    assert any(
+        "AGY request done" in record.getMessage()
+        and "one-shot; AGY 19.5s, model 1.8s, 17 prompt tokens" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_client_exposes_base_url_and_resolves_empty_command(monkeypatch, tmp_path):
     module = _load_plugin(monkeypatch)
     monkeypatch.delenv("AGY_CLI_PATH", raising=False)

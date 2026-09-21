@@ -26,6 +26,8 @@ except ImportError:  # pragma: no cover - exercised on Windows CI
 PERSISTENT_ENV = "HERMES_AGY_PERSISTENT"
 IDLE_SECONDS_ENV = "HERMES_AGY_SESSION_IDLE_SECONDS"
 MAX_SESSIONS_ENV = "HERMES_AGY_MAX_SESSIONS"
+WARM_SPARE_ENV = "HERMES_AGY_WARM_SPARE"
+MAX_SPARES = 2
 DEFAULT_IDLE_SECONDS = 900.0
 DEFAULT_MAX_SESSIONS = 4
 PRINT_TIMEOUT = "86400s"
@@ -39,13 +41,17 @@ _CONVERSATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 logger = logging.getLogger(__name__)
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def persistent_enabled() -> bool:
-    return os.environ.get(PERSISTENT_ENV, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return _env_flag(PERSISTENT_ENV)
+
+
+def warm_spare_enabled() -> bool:
+    """Keep a pre-started AGY process ready for the next new conversation."""
+    return _env_flag(WARM_SPARE_ENV)
 
 
 def _env_number(name: str, default: float) -> float:
@@ -112,6 +118,7 @@ class AGYSession:
         self.conversation_id: str | None = None
         self.store_key: tuple[str, str] | None = None
         self.turns = 0
+        self.from_spare = False
         self.last_used = time.monotonic()
         self.terminate_grace = terminate_grace
         self._lines: queue.Queue[Any] = queue.Queue()
@@ -134,8 +141,8 @@ class AGYSession:
             return
         with contextlib.suppress(ValueError):
             event = json.loads(line)
-            for field in ("init", "result"):
-                body = event.get(field) if isinstance(event, dict) else None
+            for field in (None, "init", "result"):
+                body = event if field is None else event.get(field)
                 value = body.get("conversation_id") if isinstance(body, dict) else None
                 if isinstance(value, str) and _CONVERSATION_ID_RE.fullmatch(value):
                     self.conversation_id = value
@@ -278,6 +285,9 @@ class SessionPool:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._idle: list[AGYSession] = []
+        self._spares: dict[tuple[Any, ...], AGYSession] = {}
+        self._priming: set[tuple[Any, ...]] = set()
+        self._generation = 0
         self._reaper: threading.Thread | None = None
 
     def checkout(
@@ -320,29 +330,78 @@ class SessionPool:
                 self._idle.sort(key=lambda item: item.last_used)
                 while len(self._idle) > limit:
                     evicted.append(self._idle.pop(0))
-                if self._reaper is None:
-                    self._reaper = threading.Thread(
-                        target=self._reap_forever,
-                        name="agy-session-reaper",
-                        daemon=True,
-                    )
-                    self._reaper.start()
+                self._ensure_reaper()
         else:
             evicted.append(session)
         for item in evicted:
             item.stop()
 
+    def _ensure_reaper(self) -> None:
+        """Start the idle reaper; the caller holds the lock."""
+        if self._reaper is None:
+            self._reaper = threading.Thread(
+                target=self._reap_forever, name="agy-session-reaper", daemon=True
+            )
+            self._reaper.start()
+
+    def take_spare(self, spare_key: tuple[Any, ...]) -> AGYSession | None:
+        """A pre-started process for these launch settings, if one is ready."""
+        with self._lock:
+            spare = self._spares.pop(spare_key, None)
+        if spare is not None and not spare.alive:
+            spare.stop()
+            return None
+        return spare
+
+    def prime(
+        self, spare_key: tuple[Any, ...], start: Callable[[], AGYSession]
+    ) -> None:
+        """Start a spare for these launch settings in the background."""
+        with self._lock:
+            if spare_key in self._spares or spare_key in self._priming:
+                return
+            self._priming.add(spare_key)
+            generation = self._generation
+
+        def run() -> None:
+            spare: AGYSession | None = None
+            try:
+                spare = start()
+            except Exception:
+                logger.debug("AGY warm spare could not be started", exc_info=True)
+            evicted: list[AGYSession] = []
+            with self._lock:
+                self._priming.discard(spare_key)
+                if spare is not None and generation == self._generation:
+                    self._spares[spare_key] = spare
+                    while len(self._spares) > MAX_SPARES:
+                        oldest = min(
+                            self._spares, key=lambda k: self._spares[k].last_used
+                        )
+                        evicted.append(self._spares.pop(oldest))
+                    self._ensure_reaper()
+                elif spare is not None:  # the pool was cleared meanwhile
+                    evicted.append(spare)
+            for item in evicted:
+                item.stop()
+
+        threading.Thread(target=run, name="agy-warm-spare", daemon=True).start()
+
     def _collect_expired(self) -> list[AGYSession]:
         idle_limit = _env_number(IDLE_SECONDS_ENV, DEFAULT_IDLE_SECONDS)
         now = time.monotonic()
+
+        def stale(session: AGYSession) -> bool:
+            return not session.alive or now - session.last_used > idle_limit
+
         with self._lock:
-            expired = [
-                session
-                for session in self._idle
-                if not session.alive or now - session.last_used > idle_limit
-            ]
+            expired = [session for session in self._idle if stale(session)]
             for session in expired:
                 self._idle.remove(session)
+            for spare_key, spare in list(self._spares.items()):
+                if stale(spare):
+                    expired.append(spare)
+                    del self._spares[spare_key]
         return expired
 
     def _reap_forever(self) -> None:
@@ -355,6 +414,9 @@ class SessionPool:
     def clear(self) -> None:
         with self._lock:
             sessions, self._idle = self._idle, []
+            spares, self._spares = self._spares, {}
+            self._generation += 1
+        sessions += list(spares.values())
         for session in sessions:
             session.stop()
 

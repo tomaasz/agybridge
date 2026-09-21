@@ -31,6 +31,14 @@ class ParsedOutput:
     text: str
     denied: bool
     usage: dict[str, int]
+    agy_seconds: float | None = None
+    model_seconds: float | None = None
+
+
+def _seconds(value: Any) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        return float(value)
+    return None
 
 
 def _extract_usage(result: Mapping[str, Any]) -> dict[str, int]:
@@ -66,6 +74,7 @@ def _parse_stream_json(stdout: bytes) -> ParsedOutput:
         raise AGYProtocolError("AGY returned empty stdout")
     results: list[Mapping[str, Any]] = []
     streamed_text: list[str] = []
+    model_seconds: float | None = None
     for number, line in enumerate(lines, 1):
         try:
             event = json.loads(line)
@@ -81,6 +90,11 @@ def _parse_stream_json(stdout: bytes) -> ParsedOutput:
                 raise AGYProtocolError("AGY result event is missing its result object")
             results.append(result)
             continue
+        step = event.get("step_update")
+        if isinstance(step, Mapping) and step.get("step_type") == "agent_response":
+            spent = _seconds(step.get("duration_seconds"))
+            if spent is not None:
+                model_seconds = (model_seconds or 0.0) + spent
         for key in ("content", "text", "message", "delta"):
             value = event.get(key)
             if isinstance(value, str):
@@ -112,4 +126,10 @@ def _parse_stream_json(stdout: bytes) -> ParsedOutput:
         denied = []
     if not isinstance(denied, list):
         raise AGYProtocolError("AGY denied_actions must be a list")
-    return ParsedOutput(response, bool(denied), _extract_usage(result))
+    return ParsedOutput(
+        response,
+        bool(denied),
+        _extract_usage(result),
+        _seconds(result.get("duration_seconds")),
+        model_seconds,
+    )

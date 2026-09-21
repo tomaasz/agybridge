@@ -181,12 +181,14 @@ When `HERMES_AGY_PERSISTENT=1` (or `X-AGY-Session` header is provided in HTTP re
 - Completed AGY processes are kept in an idle pool (up to `HERMES_AGY_MAX_SESSIONS`, default: 4).
 - Subsequent requests with matching history continue in the existing process, sending only conversation deltas.
 - On process restart or gateway reboot, resumable AGY conversation IDs are recovered from `~/.hermes/state/agy-conversations.json` (SHA-256 history digest, no raw message contents).
+- With `HERMES_AGY_WARM_SPARE=1`, one pre-started AGY process per model/effort waits for the next new conversation (or restart after context compression). AGY needs ~15 s after launch before its first turn runs at normal speed, so a warm spare saves that on the first reply. Each spare is an idle AGY process (~200 MB plus any MCP servers AGY starts) and expires with the idle timeout.
+- Every request logs its wall time with AGY's own and the model's durations, e.g. `AGY request done in 21.3s (session turn 4; AGY 20.9s, model 1.0s, 23046 prompt tokens)`.
 
 ---
 
 ## Testing and Verification
 
-Run the test suite (70 tests covering baseline regression, core modules, HTTP server, MCP, and integrations):
+Run the test suite (73 tests covering baseline regression, core modules, HTTP server, MCP, and integrations):
 
 ```bash
 pytest -v

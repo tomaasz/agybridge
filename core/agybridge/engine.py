@@ -56,6 +56,7 @@ from .session import (
     SessionOverflow,
     SessionTimeout,
     persistent_enabled,
+    warm_spare_enabled,
 )
 from .toolcalls import _TOOL_OPEN, _strict_tool_calls, _tool_policy
 
@@ -64,6 +65,10 @@ DEFAULT_BASE_URL = "acp://agy"
 COMMAND_ENV_VARS = ("HERMES_AGY_COMMAND", "AGY_CLI_PATH")
 
 logger = logging.getLogger(__name__)
+
+
+def _format_seconds(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1f}s"
 
 
 class AGYClient:
@@ -288,7 +293,11 @@ class AGYClient:
                 STORE.forget(session_id)
                 session = self._start_session(key, model, effort, None)
                 content = prompt
-                logger.info("AGY session started (%s)", reason)
+                logger.info(
+                    "AGY session started (%s%s)",
+                    reason,
+                    ", warm spare" if session.from_spare else "",
+                )
         session.store_key = (session_id, compat)
         try:
             return (
@@ -319,6 +328,24 @@ class AGYClient:
             raise
 
     def _start_session(
+        self,
+        key: tuple[Any, ...],
+        model: str,
+        effort: str,
+        conversation_id: str | None,
+    ) -> AGYSession:
+        if conversation_id is None and warm_spare_enabled():
+            # Launch settings only: the process takes its prompt later over stdin.
+            spare_key = key[1][:5]
+            spare = POOL.take_spare(spare_key)
+            POOL.prime(spare_key, lambda: self._spawn(key, model, effort, None))
+            if spare is not None:
+                spare.key = key
+                spare.from_spare = True
+                return spare
+        return self._spawn(key, model, effort, conversation_id)
+
+    def _spawn(
         self,
         key: tuple[Any, ...],
         model: str,
@@ -463,7 +490,8 @@ class AGYClient:
             if isinstance(extra_body, Mapping)
             else None
         )
-        deadline = time.monotonic() + effective_timeout
+        started = time.monotonic()
+        deadline = started + effective_timeout
         session: AGYSession | None = None
         if self.persistent and isinstance(session_id, str) and session_id.strip():
             parsed, session = self._persistent_turn(
@@ -478,6 +506,7 @@ class AGYClient:
             )
         else:
             parsed = self._oneshot_turn(agy_model, effort, prompt, effective_timeout)
+        repaired = False
         try:
             try:
                 tool_calls, clean_text = self._validate_reply(parsed, policy)
@@ -496,6 +525,7 @@ class AGYClient:
                     effective_timeout,
                 )
                 tool_calls, clean_text = self._validate_reply(parsed, policy)
+                repaired = True
         except BaseException:
             if session is not None:
                 session.stop()
@@ -517,6 +547,15 @@ class AGYClient:
                     history=normalized,
                     reply_ids=session.reply_ids,
                 )
+        logger.info(
+            "AGY request done in %.1fs (%s%s; AGY %s, model %s, %d prompt tokens)",
+            time.monotonic() - started,
+            "one-shot" if session is None else f"session turn {session.turns}",
+            ", repaired" if repaired else "",
+            _format_seconds(parsed.agy_seconds),
+            _format_seconds(parsed.model_seconds),
+            parsed.usage.get("prompt_tokens", 0),
+        )
         usage = SimpleNamespace(
             **parsed.usage, prompt_tokens_details=SimpleNamespace(cached_tokens=0)
         )
