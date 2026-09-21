@@ -755,7 +755,8 @@ def test_persistent_session_resumes_agy_conversation_after_restart(
     assert resumed_turn.startswith("HERMES_CONVERSATION_DELTA_JSON")
     assert "again" in resumed_turn and "hello" not in resumed_turn
     stored = (tmp_path / "agy-store.json").read_text()
-    assert set(json.loads(stored)) == {"s1"} and "hello" not in stored
+    (stored_id,) = json.loads(stored)
+    assert stored_id.startswith("s1:") and "hello" not in stored
 
 
 def test_failed_resume_falls_back_to_a_fresh_process_in_the_same_request(
@@ -915,6 +916,28 @@ def test_persistent_session_is_discarded_after_failure_or_timeout(
         client.chat.completions.create(messages=history)
     with pytest.raises(ProcessLookupError):
         os.kill(_turns(log)[-1]["pid"], 0)
+
+
+def test_side_agent_on_another_model_keeps_the_main_session_alive(
+    monkeypatch, tmp_path, request
+):
+    module = _load_plugin(monkeypatch)
+    stub, log, spawns = _session_stub(tmp_path, ["main", "review", "main again"])
+    client = _session_client(module, tmp_path, stub, request)
+    history = [{"role": "user", "content": "hello"}]
+    client.chat.completions.create(messages=history)
+    main_pid = _turns(log)[0]["pid"]
+    # Hermes' background review runs on agy-fast under the same session id.
+    client.chat.completions.create(model="gemini-3.8-flash-low", messages=history)
+    history += [
+        {"role": "assistant", "content": "main"},
+        {"role": "user", "content": "again"},
+    ]
+    result = client.chat.completions.create(messages=history)
+    assert result.choices[0].message.content == "main again"
+    assert _turns(log)[2]["pid"] == main_pid and _spawn_count(spawns) == 2
+    assert _turns(log)[2]["content"].startswith("HERMES_CONVERSATION_DELTA_JSON")
+    assert len(json.loads((tmp_path / "agy-store.json").read_text())) == 2
 
 
 def test_persistent_denied_retry_stays_in_the_same_session(

@@ -264,6 +264,9 @@ class AGYClient:
             ),
         )
         compat = hashlib.sha256(repr(key[1]).encode("utf-8")).hexdigest()
+        # One stored conversation per session and launch settings, so a side
+        # agent on another model does not overwrite the main agent's record.
+        store_id = f"{session_id}:{compat[:16]}"
         prompt_bytes = len(prompt.encode("utf-8"))
         session, delta, reason = POOL.checkout(key, normalized)
         resumed_from: str | None = None
@@ -278,9 +281,9 @@ class AGYClient:
                 len(content.encode("utf-8")),
                 prompt_bytes,
             )
-            STORE.mark_in_flight(session_id)
+            STORE.mark_in_flight(store_id)
         else:
-            resume = STORE.resume_point(session_id, compat, normalized)
+            resume = STORE.resume_point(store_id, compat, normalized)
             if resume is not None:
                 resumed_from, delta = resume
                 content = _DELTA_HEADER + json.dumps(
@@ -294,9 +297,9 @@ class AGYClient:
                     len(content.encode("utf-8")),
                     prompt_bytes,
                 )
-                STORE.mark_in_flight(session_id)
+                STORE.mark_in_flight(store_id)
             else:
-                STORE.forget(session_id)
+                STORE.forget(store_id)
                 session = self._start_session(key, model, effort, None)
                 content = prompt
                 logger.info(
@@ -304,7 +307,7 @@ class AGYClient:
                     reason,
                     ", warm spare" if session.from_spare else "",
                 )
-        session.store_key = (session_id, compat)
+        session.store_key = (store_id, compat)
         try:
             return (
                 self._drive_session(session, content, deadline, effective_timeout),
@@ -312,25 +315,25 @@ class AGYClient:
             )
         except AGYProcessError:
             if resumed_from is None:
-                STORE.forget(session_id)
+                STORE.forget(store_id)
                 raise
             logger.warning(
                 "AGY conversation %s could not be resumed; starting a fresh one",
                 resumed_from,
             )
         except BaseException:
-            STORE.forget(session_id)
+            STORE.forget(store_id)
             raise
-        STORE.forget(session_id)
+        STORE.forget(store_id)
         session = self._start_session(key, model, effort, None)
-        session.store_key = (session_id, compat)
+        session.store_key = (store_id, compat)
         try:
             return (
                 self._drive_session(session, prompt, deadline, effective_timeout),
                 session,
             )
         except BaseException:
-            STORE.forget(session_id)
+            STORE.forget(store_id)
             raise
 
     def _start_session(

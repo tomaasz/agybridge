@@ -295,25 +295,29 @@ class SessionPool:
     ) -> tuple[AGYSession | None, list[dict[str, Any]] | None, str]:
         expired = self._collect_expired()
         try:
+            # A conversation may keep one process per launch settings: Hermes
+            # runs side agents (e.g. background review on agy-fast) under the
+            # main session id, and they must not evict the main process.
             with self._lock:
-                same_conversation = [s for s in self._idle if s.key[0] == key[0]]
-                for session in same_conversation:
+                same_key = [s for s in self._idle if s.key == key]
+                for session in same_key:
                     self._idle.remove(session)
+                other_settings = any(s.key[0] == key[0] for s in self._idle)
             match: AGYSession | None = None
             delta: list[dict[str, Any]] | None = None
-            for session in same_conversation:
-                candidate = _delta(session, messages) if session.key == key else None
+            for session in same_key:
+                candidate = _delta(session, messages)
                 if match is None and candidate is not None:
                     match, delta = session, candidate
                 else:
                     expired.append(session)
             if match is not None:
                 return match, delta, "reuse"
-            if not same_conversation:
-                return None, None, "new conversation"
-            if all(session.key != key for session in same_conversation):
+            if same_key:
+                return None, None, "history diverged"
+            if other_settings:
                 return None, None, "model, effort, tools or environment changed"
-            return None, None, "history diverged"
+            return None, None, "new conversation"
         finally:
             for session in expired:
                 session.stop()
@@ -322,7 +326,7 @@ class SessionPool:
         evicted: list[AGYSession] = []
         if session.alive:
             with self._lock:
-                for other in [s for s in self._idle if s.key[0] == session.key[0]]:
+                for other in [s for s in self._idle if s.key == session.key]:
                     self._idle.remove(other)
                     evicted.append(other)
                 self._idle.append(session)
