@@ -183,7 +183,7 @@ When `HERMES_AGY_PERSISTENT=1` (or `X-AGY-Session` header is provided in HTTP re
 - On process restart or gateway reboot, resumable AGY conversation IDs are recovered from `~/.hermes/state/agy-conversations.json` (SHA-256 history digest, no raw message contents).
 - With `HERMES_AGY_WARM_SPARE=1`, one pre-started AGY process per model/effort waits for the next new conversation (or restart after context compression) or one-shot request (e.g. Hermes auxiliary tasks). A one-shot request uses the spare once and discards it, so nothing carries over between unrelated requests. This skips AGY's launch time (measured 3.9 s → 1.8 s for a one-shot reply). Each spare is an idle AGY process (~200 MB plus any MCP servers AGY starts) and expires with the idle timeout.
 - Slow AGY turns (~18 s each) are usually MCP servers that fail to connect: AGY waits for them before every turn and ignores `"disabled": true`, so remove them with `agy mcp remove <name>`.
-- Every request logs its wall time with AGY's own and the model's durations, e.g. `AGY request done in 21.3s (session turn 4; AGY 20.9s, model 1.0s, 23046 prompt tokens)`.
+- Every request logs its wall time and the model's own duration, e.g. `AGY request done in 2.2s (session turn 9; model 2.1s, 275372 prompt tokens)`. (AGY's `duration_seconds` counts from the start of the conversation, so it is not logged.)
 
 ---
 

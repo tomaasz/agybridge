@@ -31,7 +31,6 @@ class ParsedOutput:
     text: str
     denied: bool
     usage: dict[str, int]
-    agy_seconds: float | None = None
     model_seconds: float | None = None
 
 
@@ -130,6 +129,5 @@ def _parse_stream_json(stdout: bytes) -> ParsedOutput:
         response,
         bool(denied),
         _extract_usage(result),
-        _seconds(result.get("duration_seconds")),
         model_seconds,
     )

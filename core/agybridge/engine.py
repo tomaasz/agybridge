@@ -582,11 +582,10 @@ class AGYClient:
                     reply_ids=session.reply_ids,
                 )
         logger.info(
-            "AGY request done in %.1fs (%s%s; AGY %s, model %s, %d prompt tokens)",
+            "AGY request done in %.1fs (%s%s; model %s, %d prompt tokens)",
             time.monotonic() - started,
             _route(session, disposable),
             ", repaired" if repaired else "",
-            _format_seconds(parsed.agy_seconds),
             _format_seconds(parsed.model_seconds),
             parsed.usage.get("prompt_tokens", 0),
         )

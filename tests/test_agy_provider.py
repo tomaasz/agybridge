@@ -1065,13 +1065,13 @@ def test_request_timing_is_logged_with_agy_durations(monkeypatch, tmp_path, capl
     parsed = module.client._parse_stream_json(
         "\n".join(json.dumps(event) for event in events).encode()
     )
-    assert (parsed.agy_seconds, parsed.model_seconds) == (19.5, 1.75)
+    assert parsed.model_seconds == 1.75
     stub = _write_stub(tmp_path, events=events)
     with caplog.at_level("INFO", logger="agybridge.engine"):
         _client(module, tmp_path, stub).chat.completions.create(messages=[])
     assert any(
         "AGY request done" in record.getMessage()
-        and "one-shot; AGY 19.5s, model 1.8s, 17 prompt tokens" in record.getMessage()
+        and "one-shot; model 1.8s, 17 prompt tokens" in record.getMessage()
         for record in caplog.records
     )
 
