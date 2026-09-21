@@ -67,6 +67,12 @@ COMMAND_ENV_VARS = ("HERMES_AGY_COMMAND", "AGY_CLI_PATH")
 logger = logging.getLogger(__name__)
 
 
+def _route(session: AGYSession | None, disposable: bool) -> str:
+    if disposable:
+        return "one-shot, warm spare"
+    return "one-shot" if session is None else f"session turn {session.turns}"
+
+
 def _format_seconds(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.1f}s"
 
@@ -334,16 +340,30 @@ class AGYClient:
         effort: str,
         conversation_id: str | None,
     ) -> AGYSession:
-        if conversation_id is None and warm_spare_enabled():
-            # Launch settings only: the process takes its prompt later over stdin.
-            spare_key = key[1][:5]
-            spare = POOL.take_spare(spare_key)
-            POOL.prime(spare_key, lambda: self._spawn(key, model, effort, None))
+        if conversation_id is None:
+            spare = self._take_spare(model, effort)
             if spare is not None:
                 spare.key = key
-                spare.from_spare = True
                 return spare
         return self._spawn(key, model, effort, conversation_id)
+
+    def _take_spare(self, model: str, effort: str) -> AGYSession | None:
+        """A pre-started process for these launch settings; primes the next one."""
+        if not warm_spare_enabled():
+            return None
+        # Launch settings only: the process takes its prompt later over stdin.
+        launch = (
+            self.command,
+            self.cwd,
+            tuple(sorted(self._child_env.items())),
+            model,
+            effort,
+        )
+        spare = POOL.take_spare(launch)
+        POOL.prime(launch, lambda: self._spawn(launch, model, effort, None))
+        if spare is not None:
+            spare.from_spare = True
+        return spare
 
     def _spawn(
         self,
@@ -493,6 +513,7 @@ class AGYClient:
         started = time.monotonic()
         deadline = started + effective_timeout
         session: AGYSession | None = None
+        disposable = False
         if self.persistent and isinstance(session_id, str) and session_id.strip():
             parsed, session = self._persistent_turn(
                 agy_model,
@@ -505,7 +526,18 @@ class AGYClient:
                 effective_timeout,
             )
         else:
-            parsed = self._oneshot_turn(agy_model, effort, prompt, effective_timeout)
+            # A one-shot request may run in a warm spare, which is discarded
+            # afterwards so nothing carries over between unrelated requests.
+            session = self._take_spare(agy_model, effort)
+            disposable = session is not None
+            if session is None:
+                parsed = self._oneshot_turn(
+                    agy_model, effort, prompt, effective_timeout
+                )
+            else:
+                parsed = self._drive_session(
+                    session, prompt, deadline, effective_timeout
+                )
         repaired = False
         try:
             try:
@@ -532,7 +564,9 @@ class AGYClient:
                 if session.store_key is not None:
                     STORE.forget(session.store_key[0])
             raise
-        if session is not None:
+        if disposable:
+            session.stop()
+        elif session is not None:
             session.history = normalized
             session.reply_ids = tuple(call.id for call in tool_calls)
             if self.is_closed:
@@ -550,7 +584,7 @@ class AGYClient:
         logger.info(
             "AGY request done in %.1fs (%s%s; AGY %s, model %s, %d prompt tokens)",
             time.monotonic() - started,
-            "one-shot" if session is None else f"session turn {session.turns}",
+            _route(session, disposable),
             ", repaired" if repaired else "",
             _format_seconds(parsed.agy_seconds),
             _format_seconds(parsed.model_seconds),

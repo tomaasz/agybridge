@@ -1000,6 +1000,38 @@ def test_warm_spare_serves_the_next_new_conversation(monkeypatch, tmp_path, requ
         os.kill(replacement, 0)
 
 
+def test_one_shot_request_runs_in_a_warm_spare_and_discards_it(
+    monkeypatch, tmp_path, request
+):
+    module = _load_plugin(monkeypatch)
+    monkeypatch.setenv("HERMES_AGY_WARM_SPARE", "1")
+    pool = module.client.POOL
+    request.addfinalizer(pool.clear)
+    stub, log, _ = _session_stub(tmp_path, ["first", "second"])
+    client = _client(module, tmp_path, stub, persistent=False)
+
+    def wait_for_spare(exclude=None):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            ready = [item.process.pid for item in pool._spares.values()]
+            if ready and ready[0] != exclude:
+                return ready[0]
+            time.sleep(0.02)
+        raise AssertionError("no warm spare was started")
+
+    first = client.chat.completions.create(messages=[{"role": "user", "content": "a"}])
+    assert first.choices[0].message.content == "first"
+    spare_pid = wait_for_spare()
+    second = client.chat.completions.create(messages=[{"role": "user", "content": "b"}])
+    assert second.choices[0].message.content == "second"
+    turn = _turns(log)[1]
+    assert turn["pid"] == spare_pid and "HERMES_CONVERSATION_JSON" in turn["content"]
+    with pytest.raises(ProcessLookupError):  # used once, never pooled
+        os.kill(spare_pid, 0)
+    assert not pool._idle
+    assert wait_for_spare(exclude=spare_pid) != spare_pid
+
+
 def test_warm_spare_is_opt_in(monkeypatch, tmp_path, request):
     module = _load_plugin(monkeypatch)
     monkeypatch.delenv("HERMES_AGY_WARM_SPARE", raising=False)
