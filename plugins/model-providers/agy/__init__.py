@@ -12,6 +12,7 @@ for _path in (str(_REPO_ROOT), str(_CORE_DIR)):
         sys.path.insert(0, _path)
 
 from adapters.hermes import (
+    CONTEXT_LENGTH,
     FAST_MODEL,
     MODEL,
     AGYClient,
@@ -27,6 +28,7 @@ from adapters.hermes import (
 from . import client, session
 
 __all__ = [
+    "CONTEXT_LENGTH",
     "FAST_MODEL",
     "MODEL",
     "AGYClient",

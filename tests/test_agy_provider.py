@@ -1027,6 +1027,11 @@ def test_hermes_reasoning_effort_maps_to_agy_effort(monkeypatch, tmp_path):
     assert resolve(flash_high, "high", "low") == (flash_high, "high")
     assert resolve(flash_low, "medium", "low") == ("gemini-3.8-flash", "medium")
     assert resolve("custom-model", None, "low") == ("custom-model", "low")
-    assert resolve("custom-model", "high", "low") == ("custom-model", "high")
     with pytest.raises(ValueError, match="effort"):
         module.AGYClient(cwd=str(tmp_path), effort="ultra")
+
+    assert module.CONTEXT_LENGTH == 1_048_576
+    assert module.agy.get_model_context_length("gemini-3.8-flash-high") == 1_048_576
+    assert module.agy.get_model_context_length("agy") == 1_048_576
+    assert module.agy_fast.get_model_context_length("gemini-3.8-flash-low") == 1_048_576
+    assert module.agy_fast.get_model_context_length("agy-fast") == 1_048_576

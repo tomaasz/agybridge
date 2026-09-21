@@ -26,6 +26,7 @@ except ImportError as exc:  # pragma: no cover - exercised by an import subproce
 
 MODEL = "gemini-3.8-flash-high"
 FAST_MODEL = "gemini-3.8-flash-low"
+CONTEXT_LENGTH = 1_048_576
 
 
 class AGYProfile(ProviderProfile):
@@ -41,6 +42,10 @@ class AGYProfile(ProviderProfile):
         super().__init__(*args, **kwargs)
         self.effort = effort
         self.default_model = default_model
+
+    def get_model_context_length(self, model: str) -> int | None:
+        """Provider-qualified context bound for AGY models (1M tokens)."""
+        return CONTEXT_LENGTH
 
     def create_client(self, **kwargs: Any) -> HermesAGYClient:
         """Use AGY's stream-json process instead of an HTTP client."""
@@ -123,6 +128,7 @@ register_provider(agy_fast)
 AGYClient = HermesAGYClient
 
 __all__ = [
+    "CONTEXT_LENGTH",
     "FAST_MODEL",
     "MODEL",
     "AGYClient",
