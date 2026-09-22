@@ -57,10 +57,11 @@ def reset_seconds(message: str) -> float | None:
     return total or None
 
 
-def quota_key(model: str) -> str:
-    """Quota bucket for a model: the effort variants of one model share it."""
+def quota_key(model: str, account: str = "") -> str:
+    """Quota bucket: one per Google account and model; effort variants share it."""
     base, _, suffix = model.strip().rpartition("-")
-    return base if base and suffix in AGY_EFFORTS else model.strip()
+    bucket = base if base and suffix in AGY_EFFORTS else model.strip()
+    return f"{account}/{bucket}" if account else bucket
 
 
 def format_duration(seconds: float) -> str:
@@ -147,13 +148,13 @@ class QuotaBook:
             logger.debug("AGY quota state update failed", exc_info=True)
             return None
 
-    def check(self, model: str) -> bool:
+    def check(self, model: str, account: str = "") -> bool:
         """Raise AGYQuotaError while ``model``'s quota is remembered as spent.
 
         Returns True when the request goes ahead as a probe of a remembered
         quota, so a success should call :meth:`clear`.
         """
-        key = quota_key(model)
+        key = quota_key(model, account)
 
         def change(data: dict[str, Any]) -> AGYQuotaError | bool:
             entry = data.get(key)
@@ -179,6 +180,7 @@ class QuotaBook:
                 f"{format_duration(until - now)}): {message}",
                 quota_message=message,
                 retry_after=until - now,
+                remembered=True,
             )
 
         result = self._change(change)
@@ -186,9 +188,9 @@ class QuotaBook:
             raise result
         return bool(result)
 
-    def record(self, model: str, message: str) -> float:
+    def record(self, model: str, message: str, account: str = "") -> float:
         """Remember ``model``'s quota as spent; returns seconds until reset."""
-        key = quota_key(model)
+        key = quota_key(model, account)
         seconds = reset_seconds(message)
         cooldown = min(
             MAX_COOLDOWN_SECONDS,
@@ -212,14 +214,14 @@ class QuotaBook:
         )
         return cooldown
 
-    def clear(self, model: str | None = None) -> None:
+    def clear(self, model: str | None = None, account: str = "") -> None:
         """Forget the record for ``model``, or every record when None."""
 
         def change(data: dict[str, Any]) -> None:
             if model is None:
                 data.clear()
             else:
-                data.pop(quota_key(model), None)
+                data.pop(quota_key(model, account), None)
 
         self._change(change)
 

@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from .accounts import ACCOUNTS
 from .agylog import AGYLogWatcher, new_log_path
 from .backends.agy import AGY_EFFORTS, DEFAULT_BACKEND, agy_effort
 from .backends.base import CliBackend
@@ -65,6 +66,8 @@ from .session import (
 from .toolcalls import _TOOL_OPEN, _strict_tool_calls, _tool_policy
 
 SESSION_ID_FIELD = "hermes_session_id"
+# Pool accounts tried after the first one within a single request.
+MAX_ACCOUNT_SWITCHES = 3
 DEFAULT_BASE_URL = "acp://agy"
 COMMAND_ENV_VARS = ("HERMES_AGY_COMMAND", "AGY_CLI_PATH")
 
@@ -303,6 +306,7 @@ class AGYClient:
         normalized: list[dict[str, Any]],
         prompt: str,
         effective_timeout: float,
+        account: str = "",
     ) -> tuple[ParsedOutput, AGYSession]:
         deadline = time.monotonic() + effective_timeout
         fingerprint = hashlib.sha256(
@@ -317,6 +321,10 @@ class AGYClient:
                 model,
                 effort,
                 fingerprint,
+                # A pool account is part of the launch settings: a session or
+                # stored conversation of one Google account is never resumed
+                # on another. Without a pool the key stays as it always was.
+                *((account,) if account else ()),
             ),
         )
         compat = hashlib.sha256(repr(key[1]).encode("utf-8")).hexdigest()
@@ -345,7 +353,7 @@ class AGYClient:
                 content = _DELTA_HEADER + json.dumps(
                     delta, ensure_ascii=False, separators=(",", ":")
                 )
-                session = self._start_session(key, model, effort, resumed_from)
+                session = self._start_session(key, model, effort, resumed_from, account)
                 logger.info(
                     "AGY session resumed (conversation %s): %d new message(s), %d of %d prompt bytes",
                     resumed_from,
@@ -356,7 +364,7 @@ class AGYClient:
                 STORE.mark_in_flight(store_id)
             else:
                 STORE.forget(store_id)
-                session = self._start_session(key, model, effort, None)
+                session = self._start_session(key, model, effort, None, account)
                 content = prompt
                 logger.info(
                     "AGY session started (%s%s)",
@@ -381,7 +389,7 @@ class AGYClient:
             STORE.forget(store_id)
             raise
         STORE.forget(store_id)
-        session = self._start_session(key, model, effort, None)
+        session = self._start_session(key, model, effort, None, account)
         session.store_key = (store_id, compat)
         try:
             return (
@@ -398,15 +406,18 @@ class AGYClient:
         model: str,
         effort: str,
         conversation_id: str | None,
+        account: str = "",
     ) -> AGYSession:
         if conversation_id is None:
-            spare = self._take_spare(model, effort)
+            spare = self._take_spare(model, effort, account)
             if spare is not None:
                 spare.key = key
                 return spare
         return self._spawn(key, model, effort, conversation_id)
 
-    def _take_spare(self, model: str, effort: str) -> AGYSession | None:
+    def _take_spare(
+        self, model: str, effort: str, account: str = ""
+    ) -> AGYSession | None:
         """A pre-started process for these launch settings; primes the next one."""
         if not warm_spare_enabled():
             return None
@@ -417,6 +428,7 @@ class AGYClient:
             tuple(sorted(self._child_env.items())),
             model,
             effort,
+            *((account,) if account else ()),
         )
         spare = POOL.take_spare(launch)
         POOL.prime(launch, lambda: self._spawn(launch, model, effort, None))
@@ -538,22 +550,38 @@ class AGYClient:
         return tool_calls, clean_text
 
     def _create(self, *, model: str | None = None, **call: Any) -> Any:
-        # A remembered spent quota answers at once instead of launching AGY.
         quota_model = (model or self.default_model).strip()
-        probing = QUOTA.check(quota_model) if quota_model else False
-        try:
-            result = self._create_unchecked(model=model, **call)
-        except AGYQuotaError as exc:
-            exc.retry_after = QUOTA.record(quota_model, exc.quota_message or str(exc))
-            raise
-        if probing:
-            QUOTA.clear(quota_model)
-            logger.info("AGY quota for %s is available again", quota_model)
-        return result
+        for attempt in range(MAX_ACCOUNT_SWITCHES + 1):
+            # The agent-lb pool decides the Google account; a new one makes
+            # the idle sessions of the old one useless.
+            if ACCOUNTS.ensure():
+                POOL.clear()
+            account = ACCOUNTS.current_id()
+            try:
+                # A remembered spent quota answers at once instead of launching AGY.
+                probing = QUOTA.check(quota_model, account) if quota_model else False
+                result = self._create_unchecked(model=model, account=account, **call)
+            except AGYQuotaError as exc:
+                message = exc.quota_message or str(exc)
+                if not exc.remembered:
+                    exc.retry_after = QUOTA.record(quota_model, message, account)
+                if attempt < MAX_ACCOUNT_SWITCHES and ACCOUNTS.report_quota(
+                    message, exc.retry_after
+                ):
+                    POOL.clear()
+                    logger.info("retrying the AGY request on the next pool account")
+                    continue
+                raise
+            if probing:
+                QUOTA.clear(quota_model, account)
+                logger.info("AGY quota for %s is available again", quota_model)
+            return result
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _create_unchecked(
         self,
         *,
+        account: str = "",
         model: str | None = None,
         messages: list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]] | None = None,
@@ -607,11 +635,12 @@ class AGYClient:
                 normalized,
                 prompt,
                 effective_timeout,
+                account,
             )
         else:
             # A one-shot request may run in a warm spare, which is discarded
             # afterwards so nothing carries over between unrelated requests.
-            session = self._take_spare(agy_model, effort)
+            session = self._take_spare(agy_model, effort, account)
             disposable = session is not None
             if session is None:
                 parsed = self._oneshot_turn(

@@ -32,10 +32,13 @@ class AGYQuotaError(AGYProcessError):
         *,
         quota_message: str | None = None,
         retry_after: float | None = None,
+        remembered: bool = False,
     ) -> None:
         super().__init__(message)
         self.quota_message = quota_message
         self.retry_after = retry_after
+        # True when answered from the bridge's record, without running AGY.
+        self.remembered = remembered
 
 
 class AGYProtocolError(AGYError):
