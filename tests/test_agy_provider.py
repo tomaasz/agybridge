@@ -1112,6 +1112,35 @@ def test_client_exposes_base_url_and_resolves_empty_command(monkeypatch, tmp_pat
         module.AGYClient(command=42, cwd=str(tmp_path))
 
 
+def test_client_falls_back_to_home_when_the_process_directory_is_gone(
+    monkeypatch, tmp_path
+):
+    module = _load_plugin(monkeypatch)
+    home, gone = tmp_path / "home", tmp_path / "gone"
+    home.mkdir()
+    gone.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+    assert module.AGYClient().cwd == str(home.resolve())
+    with pytest.raises(ValueError, match="cwd"):  # an explicit missing cwd still fails
+        module.AGYClient(cwd=str(gone))
+
+
+def test_denied_action_retry_is_logged_with_the_action_name(
+    monkeypatch, tmp_path, request, caplog
+):
+    module = _load_plugin(monkeypatch)
+    stub, _log, _ = _session_stub(tmp_path, ["__DENY__", "ok"])
+    client = _session_client(module, tmp_path, stub, request)
+    with caplog.at_level("INFO", logger="agybridge.engine"):
+        client.chat.completions.create(messages=[{"role": "user", "content": "hi"}])
+    assert any(
+        "AGY tried its own action (internal); retrying once" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 def test_persistent_mode_is_opt_in_and_idle_sessions_expire(
     monkeypatch, tmp_path, request
 ):

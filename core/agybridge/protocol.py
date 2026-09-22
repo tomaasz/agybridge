@@ -32,6 +32,7 @@ class ParsedOutput:
     denied: bool
     usage: dict[str, int]
     model_seconds: float | None = None
+    denied_names: tuple[str, ...] = ()
 
 
 def _seconds(value: Any) -> float | None:
@@ -130,4 +131,17 @@ def _parse_stream_json(stdout: bytes) -> ParsedOutput:
         bool(denied),
         _extract_usage(result),
         model_seconds,
+        tuple(_denied_name(item) for item in denied),
     )
+
+
+def _denied_name(item: Any) -> str:
+    """Short label for one denied AGY action, for diagnostics only."""
+    if isinstance(item, Mapping):
+        for key in ("action", "tool", "name", "type"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:64]
+    if isinstance(item, str) and item.strip():
+        return item.strip()[:64]
+    return "unknown"

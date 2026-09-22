@@ -67,6 +67,27 @@ COMMAND_ENV_VARS = ("HERMES_AGY_COMMAND", "AGY_CLI_PATH")
 logger = logging.getLogger(__name__)
 
 
+def _process_cwd() -> Path:
+    """The process directory, or home when it was deleted under us.
+
+    A Hermes side agent may create a client without a cwd while a tool is
+    cleaning up the directory the process is in; os.getcwd() then raises.
+    """
+    try:
+        return Path(os.getcwd()).resolve()
+    except FileNotFoundError:
+        home = Path.home()
+        logger.warning("AGY: process directory no longer exists; using %s", home)
+        return home
+
+
+def _log_denied_retry(parsed: ParsedOutput) -> None:
+    logger.info(
+        "AGY tried its own action (%s); retrying once with the Hermes tool contract",
+        ", ".join(parsed.denied_names) or "unnamed",
+    )
+
+
 def _route(session: AGYSession | None, disposable: bool) -> str:
     if disposable:
         return "one-shot, warm spare"
@@ -126,7 +147,12 @@ class AGYClient:
             raise ValueError(
                 "AGY process args are disabled because they can select a subcommand before the sandbox flags; use a wrapper executable instead"
             )
-        workdir = Path(acp_cwd or cwd or os.getcwd()).expanduser().resolve()
+        explicit_cwd = acp_cwd or cwd
+        workdir = (
+            Path(explicit_cwd).expanduser().resolve()
+            if explicit_cwd
+            else _process_cwd()
+        )
         if not workdir.is_dir():
             raise ValueError("AGY cwd must be an existing directory")
         if not isinstance(default_model, str) or not default_model.strip():
@@ -232,6 +258,7 @@ class AGYClient:
             ):
                 return parsed
             if attempt == 0:
+                _log_denied_retry(parsed)
                 current_prompt = prompt + "\n\n" + _DENIED_RETRY
         raise AGYProcessError(
             "AGY attempted an internal action twice; Hermes fallback is required"
@@ -443,6 +470,7 @@ class AGYClient:
                     succeeded = True
                     return parsed
                 if attempt == 0:
+                    _log_denied_retry(parsed)
                     content = _DENIED_RETRY
             raise AGYProcessError(
                 "AGY attempted an internal action twice; Hermes fallback is required"
