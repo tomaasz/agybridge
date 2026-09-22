@@ -55,6 +55,7 @@ class AGYBackend:
         print_timeout: str,
         effort: str,
         conversation_id: str | None = None,
+        log_file: str | None = None,
     ) -> list[str]:
         argv = [
             command,
@@ -75,6 +76,8 @@ class AGYBackend:
         ]
         if conversation_id:
             argv += ["--conversation", conversation_id]
+        if log_file:
+            argv += ["--log-file", log_file]
         return argv
 
     def map_model_and_effort(

@@ -53,8 +53,13 @@ def run_process(
     is_closed: Callable[[], bool] | None = None,
     on_process_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
     on_process_done: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    abort: Callable[[], BaseException | None] | None = None,
 ) -> tuple[bytes, bytes]:
-    """Execute a subprocess with bounded stream readers and strict deadline."""
+    """Execute a subprocess with bounded stream readers and strict deadline.
+
+    ``abort`` is polled while the process runs; an exception it returns stops
+    the process and is raised.
+    """
     popen_kwargs: dict[str, Any] = {}
     if os.name == "posix":
         popen_kwargs["start_new_session"] = True
@@ -136,6 +141,7 @@ def run_process(
 
         deadline = time.monotonic() + timeout
         timed_out = False
+        aborted: BaseException | None = None
         while process.poll() is None:
             if overflow.is_set():
                 stop_process(process, terminate_grace)
@@ -144,11 +150,18 @@ def run_process(
                 timed_out = True
                 stop_process(process, terminate_grace)
                 break
+            if abort is not None:
+                aborted = abort()
+                if aborted is not None:
+                    stop_process(process, terminate_grace)
+                    break
             time.sleep(0.02)
 
         out_thread.join(timeout=terminate_grace)
         err_thread.join(timeout=terminate_grace)
 
+        if aborted is not None:
+            raise aborted
         if timed_out:
             raise AGYTimeoutError(f"AGY exceeded the {timeout:g}s request timeout")
         if overflow.is_set():

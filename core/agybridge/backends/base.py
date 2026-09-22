@@ -17,6 +17,7 @@ class CliBackend(Protocol):
         print_timeout: str,
         effort: str,
         conversation_id: str | None = None,
+        log_file: str | None = None,
     ) -> list[str]:
         """Construct safe command-line arguments."""
         ...

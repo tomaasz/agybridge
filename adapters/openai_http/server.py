@@ -16,6 +16,7 @@ from agybridge.engine import SESSION_ID_FIELD, AGYClient
 from agybridge.protocol import (
     AGYProcessError,
     AGYProtocolError,
+    AGYQuotaError,
     AGYTimeoutError,
 )
 
@@ -183,6 +184,12 @@ class OpenAIHTTPHandler(BaseHTTPRequestHandler):
             )
         except AGYTimeoutError as exc:
             self._send_error(504, str(exc), error_type="timeout_error", code="timeout")
+            return
+        except AGYQuotaError as exc:
+            # 429 lets OpenAI-compatible clients fall back to another provider.
+            self._send_error(
+                429, str(exc), error_type="rate_limit_error", code="insufficient_quota"
+            )
             return
         except (AGYProcessError, AGYProtocolError) as exc:
             self._send_error(502, str(exc), error_type="api_error", code="bad_gateway")

@@ -18,6 +18,8 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from .agylog import AGYLogWatcher
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - exercised on Windows CI
@@ -70,6 +72,10 @@ class SessionOverflow(Exception):
     """The turn produced more stdout than allowed."""
 
 
+class SessionQuota(Exception):
+    """AGY logged that its quota is exhausted; the message is the argument."""
+
+
 class SessionDied(Exception):
     """The AGY process exited or closed its pipes."""
 
@@ -99,6 +105,7 @@ class AGYSession:
         env: Mapping[str, str],
         max_stderr_bytes: int,
         terminate_grace: float,
+        watcher: AGYLogWatcher | None = None,
     ) -> None:
         popen_kwargs: dict[str, Any] = {}
         if os.name == "posix":
@@ -113,6 +120,7 @@ class AGYSession:
             **popen_kwargs,
         )
         self.key = key
+        self.watcher = watcher
         self.history: list[dict[str, Any]] | None = None
         self.reply_ids: tuple[str, ...] = ()
         self.conversation_id: str | None = None
@@ -201,8 +209,12 @@ class AGYSession:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SessionTimeout()
+            if self.watcher is not None:
+                quota = self.watcher.check()
+                if quota:
+                    raise SessionQuota(quota)
             try:
-                line = self._lines.get(timeout=min(remaining, 0.5))
+                line = self._lines.get(timeout=min(remaining, 0.25))
             except queue.Empty:
                 continue
             if line is _EOF:
@@ -236,6 +248,8 @@ class AGYSession:
                         self.process.kill()
         with contextlib.suppress(Exception):
             self.process.wait(timeout=self.terminate_grace)
+        if self.watcher is not None:
+            self.watcher.close()
 
 
 def history_digest(messages: list[dict[str, Any]]) -> str:

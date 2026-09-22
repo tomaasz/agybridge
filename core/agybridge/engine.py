@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from .agylog import AGYLogWatcher, new_log_path
 from .backends.agy import AGY_EFFORTS, DEFAULT_BACKEND, agy_effort
 from .backends.base import CliBackend
 from .ports import DEFAULT_PORTS, BridgePorts
@@ -31,6 +32,7 @@ from .prompt import (
 from .protocol import (
     AGYProcessError,
     AGYProtocolError,
+    AGYQuotaError,
     AGYTimeoutError,
     ParsedOutput,
 )
@@ -54,6 +56,7 @@ from .session import (
     AGYSession,
     SessionDied,
     SessionOverflow,
+    SessionQuota,
     SessionTimeout,
     persistent_enabled,
     warm_spare_enabled,
@@ -86,6 +89,14 @@ def _log_denied_retry(parsed: ParsedOutput) -> None:
         "AGY tried its own action (%s); retrying once with the Hermes tool contract",
         ", ".join(parsed.denied_names) or "unnamed",
     )
+
+
+def _quota_error(message: str) -> AGYQuotaError:
+    logger.warning(
+        "AGY quota exhausted (%s); stopping AGY instead of waiting out its retries",
+        message,
+    )
+    return AGYQuotaError(f"AGY quota exhausted: {message}")
 
 
 def _route(session: AGYSession | None, disposable: bool) -> str:
@@ -223,10 +234,22 @@ class AGYClient:
                 raise AGYTimeoutError(
                     f"AGY exceeded the {effective_timeout:g}s request timeout"
                 )
+            log_path = new_log_path()
+            watcher = AGYLogWatcher(log_path) if log_path is not None else None
             argv = self.backend.build_argv(
-                self.command, model, f"{max(1, math.ceil(remaining))}s", effort
+                self.command,
+                model,
+                f"{max(1, math.ceil(remaining))}s",
+                effort,
+                log_file=str(log_path) if log_path is not None else None,
             )
             stdin_bytes = self.backend.format_stdin(current_prompt)
+
+            def quota_abort(
+                watcher: AGYLogWatcher | None = watcher,
+            ) -> AGYQuotaError | None:
+                message = watcher.check() if watcher is not None else None
+                return _quota_error(message) if message else None
 
             def on_start(proc: subprocess.Popen[bytes]) -> None:
                 with self._process_lock:
@@ -237,19 +260,24 @@ class AGYClient:
                 with self._process_lock:
                     self._active_processes.discard(proc)
 
-            stdout, _stderr = run_process(
-                argv,
-                cwd=self.cwd,
-                env=self._child_env,
-                timeout=remaining,
-                max_stdout_bytes=self.max_stdout_bytes,
-                max_stderr_bytes=self.max_stderr_bytes,
-                terminate_grace=self.terminate_grace,
-                stdin_data=stdin_bytes,
-                is_closed=lambda: self.is_closed,
-                on_process_start=on_start,
-                on_process_done=on_done,
-            )
+            try:
+                stdout, _stderr = run_process(
+                    argv,
+                    cwd=self.cwd,
+                    env=self._child_env,
+                    timeout=remaining,
+                    max_stdout_bytes=self.max_stdout_bytes,
+                    max_stderr_bytes=self.max_stderr_bytes,
+                    terminate_grace=self.terminate_grace,
+                    stdin_data=stdin_bytes,
+                    is_closed=lambda: self.is_closed,
+                    on_process_start=on_start,
+                    on_process_done=on_done,
+                    abort=quota_abort,
+                )
+            finally:
+                if watcher is not None:
+                    watcher.close()
             parsed = self.backend.parse_output(stdout)
             if (
                 not parsed.denied
@@ -402,8 +430,14 @@ class AGYClient:
         effort: str,
         conversation_id: str | None,
     ) -> AGYSession:
+        log_path = new_log_path()
         argv = self.backend.build_argv(
-            self.command, model, PRINT_TIMEOUT, effort, conversation_id
+            self.command,
+            model,
+            PRINT_TIMEOUT,
+            effort,
+            conversation_id,
+            log_file=str(log_path) if log_path is not None else None,
         )
         try:
             return AGYSession(
@@ -413,6 +447,7 @@ class AGYClient:
                 env=self._child_env,
                 max_stderr_bytes=self.max_stderr_bytes,
                 terminate_grace=self.terminate_grace,
+                watcher=AGYLogWatcher(log_path) if log_path is not None else None,
             )
         except FileNotFoundError as exc:
             raise AGYProcessError(
@@ -451,6 +486,8 @@ class AGYClient:
                     raise AGYTimeoutError(
                         f"AGY exceeded the {effective_timeout:g}s request timeout"
                     ) from exc
+                except SessionQuota as exc:
+                    raise _quota_error(str(exc)) from exc
                 except SessionOverflow as exc:
                     raise AGYProtocolError(
                         f"AGY stdout exceeded the {self.max_stdout_bytes}-byte limit"

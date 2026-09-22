@@ -8,6 +8,7 @@ from .protocol import (
     AGYError,
     AGYProcessError,
     AGYProtocolError,
+    AGYQuotaError,
     AGYTimeoutError,
 )
 from .security import (
@@ -38,6 +39,7 @@ __all__ = [
     "AGYError",
     "AGYProcessError",
     "AGYProtocolError",
+    "AGYQuotaError",
     "AGYTimeoutError",
     "BridgePorts",
     "_agy_model_and_effort",

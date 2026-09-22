@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+
+from .security import _redact
 
 
 class AGYError(RuntimeError):
@@ -16,12 +19,31 @@ class AGYProcessError(AGYError):
     """The external process could not produce a successful response."""
 
 
+class AGYQuotaError(AGYProcessError):
+    """AGY's account quota is exhausted; retrying before it resets is pointless."""
+
+
 class AGYProtocolError(AGYError):
     """AGY emitted output that violates the stream or tool-call contract."""
 
 
 class AGYTimeoutError(AGYError, TimeoutError):
     """AGY exceeded the wall-clock deadline."""
+
+
+# AGY words a spent quota as e.g. "RESOURCE_EXHAUSTED (code 429): Individual
+# quota reached. ... Resets in 94h6m56s." Only a 429 that names a quota counts:
+# a plain rate limit clears within AGY's own retries.
+_QUOTA_RE = re.compile(
+    r"RESOURCE_EXHAUSTED \(code 429\):\s*(?P<message>[^()\n]*quota[^()\n]*)",
+    re.IGNORECASE,
+)
+
+
+def quota_message(text: str) -> str | None:
+    """AGY's quota-exhausted message in ``text``, or None if there is none."""
+    match = _QUOTA_RE.search(text)
+    return match.group("message").strip() if match else None
 
 
 @dataclass(frozen=True)
@@ -121,6 +143,18 @@ def _parse_stream_json(stdout: bytes) -> ParsedOutput:
         response = ""
     if not isinstance(response, str):
         raise AGYProtocolError("AGY result response must be text")
+    status = result.get("status")
+    if isinstance(status, str) and status.upper() == "ERROR" and not response.strip():
+        # A failed run is not an empty reply: asking AGY to repair it would
+        # only repeat the same failure.
+        error = result.get("error")
+        detail = _redact(error).strip() if isinstance(error, str) else ""
+        quota = quota_message(detail)
+        if quota:
+            raise AGYQuotaError(f"AGY quota exhausted: {quota}")
+        raise AGYProcessError(
+            f"AGY run failed: {detail}" if detail else "AGY run failed"
+        )
     denied = result.get("denied_actions", [])
     if denied is None:
         denied = []
