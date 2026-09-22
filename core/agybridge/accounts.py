@@ -1,7 +1,8 @@
 """The Google account AGY runs on, taken from the agent-lb pool.
 
 agent-lb keeps the operator's Google accounts for AGY and decides which one a
-station uses. AGY reads its login from ``~/.gemini/jetski-standalone-oauth-token``
+station uses. AGY reads its login from
+``~/.gemini/antigravity-cli/antigravity-oauth-token``
 when a process starts, so the bridge puts the chosen account's token there
 before launching AGY. When AGY reports a spent quota the bridge tells agent-lb,
 which marks that account and answers with the next one; the request is then
@@ -85,7 +86,7 @@ def token_file() -> Path:
     return (
         Path(raw).expanduser()
         if raw
-        else Path.home() / ".gemini" / "jetski-standalone-oauth-token"
+        else Path.home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
     )
 
 
