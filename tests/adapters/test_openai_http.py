@@ -239,3 +239,26 @@ def test_quota_error_maps_to_429(http_server):
     error = json.loads(info.value.read().decode("utf-8"))["error"]
     assert error["code"] == "insufficient_quota"
     assert "Resets in 94h" in error["message"]
+
+
+def test_quota_error_sends_retry_after(http_server):
+    from agybridge.protocol import AGYQuotaError
+
+    base_url, client = http_server
+
+    def exhausted(**kwargs):
+        raise AGYQuotaError("AGY quota exhausted: x", retry_after=3600.4)
+
+    client.chat.completions.create = exhausted
+    req = urllib.request.Request(
+        f"{base_url}/v1/chat/completions",
+        data=json.dumps({"messages": [{"role": "user", "content": "hi"}]}).encode(),
+        headers={
+            "Authorization": "Bearer test-secret-token",
+            "Content-Type": "application/json",
+        },
+    )
+    with pytest.raises(urllib.error.HTTPError) as info:
+        urllib.request.urlopen(req)
+    assert info.value.code == 429
+    assert info.value.headers["Retry-After"] == "3600"

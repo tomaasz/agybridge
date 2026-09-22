@@ -15,5 +15,10 @@ for path_str in (str(ROOT), str(CORE)):
 
 @pytest.fixture(autouse=True)
 def _agy_logs_in_tmp(monkeypatch, tmp_path_factory):
-    """Keep the per-process AGY logs out of the real ~/.gemini during tests."""
+    """Keep AGY logs and quota records out of the real home during tests."""
     monkeypatch.setenv("HERMES_AGY_LOG_DIR", str(tmp_path_factory.mktemp("agy-logs")))
+    # A remembered quota would leak between tests and into the real ~/.hermes.
+    monkeypatch.setenv(
+        "HERMES_AGY_QUOTA_STATE",
+        str(tmp_path_factory.mktemp("agy-quota") / "agy-quota.json"),
+    )

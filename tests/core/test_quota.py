@@ -18,6 +18,7 @@ from agybridge.protocol import (
     _parse_stream_json,
     quota_message,
 )
+from agybridge.quota import QUOTA, quota_key, reset_seconds
 from agybridge.session import POOL
 
 # Verbatim shape of AGY's log line when the account quota is spent.
@@ -32,6 +33,7 @@ QUOTA_LINE = (
 def _log_dir(monkeypatch, tmp_path):
     monkeypatch.setenv(agylog.LOG_DIR_ENV, str(tmp_path / "agy-logs"))
     monkeypatch.setenv("HERMES_AGY_SESSION_STORE", str(tmp_path / "store.json"))
+    monkeypatch.setenv("HERMES_AGY_QUOTA_STATE", str(tmp_path / "agy-quota.json"))
 
 
 def _result(**result) -> bytes:
@@ -177,3 +179,112 @@ def test_agy_gets_a_private_log_file(tmp_path):
     assert log_file.parent == tmp_path / "agy-logs"
     assert log_file.name.startswith("agybridge-")
     assert stat.S_IMODE(log_file.parent.stat().st_mode) == 0o700
+
+
+# --- remembering a spent quota until it resets ---------------------------
+
+
+def _counting_stub(tmp_path: Path, reply: str) -> tuple[Path, Path]:
+    """AGY stand-in that counts launches; 'quota' logs a spent quota and hangs."""
+    calls = tmp_path / "calls"
+    script = tmp_path / f"agy-{reply}.py"
+    script.write_text(
+        f"#!{sys.executable}\nimport json, pathlib, sys, time\n"
+        f"p = pathlib.Path({str(calls)!r}); p.write_text(str(int(p.read_text()) + 1 if p.exists() else 1))\n"
+        "log = sys.argv[sys.argv.index('--log-file') + 1]\n"
+        "sys.stdin.read()\n"
+        f"if {reply!r} == 'quota':\n"
+        f"    open(log, 'a').write({QUOTA_LINE!r} + '\\n'); time.sleep(60)\n"
+        "print(json.dumps({'event': 'result', 'result': {'response': 'ok'}}), flush=True)\n",
+        encoding="utf-8",
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return script, calls
+
+
+def _ask(client, model="gemini-3.8-flash-low"):
+    return client.chat.completions.create(
+        model=model, messages=[{"role": "user", "content": "hi"}]
+    )
+
+
+def test_reset_seconds_and_quota_key():
+    assert reset_seconds(QUOTA_LINE) == 94 * 3600 + 6 * 60 + 56
+    assert reset_seconds("Resets in 45s.") == 45
+    assert reset_seconds("Resets in 2d3h.") == 2 * 86400 + 3 * 3600
+    assert reset_seconds("no reset time here") is None
+    assert quota_key("gemini-3.8-flash-low") == quota_key("gemini-3.8-flash-high")
+    assert quota_key("gemini-3.8-flash") == "gemini-3.8-flash"
+
+
+def test_spent_quota_is_answered_without_launching_agy(tmp_path):
+    stub, calls = _counting_stub(tmp_path, "quota")
+    client = AGYClient(
+        command=str(stub), cwd=str(tmp_path), timeout=30, terminate_grace=0.2
+    )
+    with pytest.raises(AGYQuotaError) as first:
+        _ask(client)
+    assert first.value.retry_after == pytest.approx(94 * 3600 + 6 * 60 + 56, abs=5)
+    started = time.monotonic()
+    # The high-effort variant of the same model shares the quota.
+    with pytest.raises(
+        AGYQuotaError, match=r"remembered, resets in 94h0[56]m"
+    ) as second:
+        _ask(client, "gemini-3.8-flash-high")
+    assert time.monotonic() - started < 0.5
+    assert second.value.retry_after > 94 * 3600
+    assert calls.read_text() == "1"  # AGY was launched only once
+    # The record is shared with other processes on the host.
+    entry = json.loads(Path(os.environ["HERMES_AGY_QUOTA_STATE"]).read_text())
+    assert set(entry) == {"gemini-3.8-flash"}
+
+
+def test_probe_clears_the_record_when_the_quota_is_back(tmp_path, monkeypatch):
+    stub, _ = _counting_stub(tmp_path, "quota")
+    with pytest.raises(AGYQuotaError):
+        _ask(
+            AGYClient(
+                command=str(stub), cwd=str(tmp_path), timeout=30, terminate_grace=0.2
+            )
+        )
+    ok, _ = _counting_stub(tmp_path, "ok")
+    client = AGYClient(command=str(ok), cwd=str(tmp_path), timeout=10)
+    with pytest.raises(AGYQuotaError):
+        _ask(client)  # still inside the probe interval
+    # Pretend the probe interval passed (e.g. another account was logged in).
+    real_time = time.time
+    monkeypatch.setattr(time, "time", lambda: real_time() + 901)
+    assert _ask(client).choices[0].message.content == "ok"
+    assert QUOTA.entries() == {}
+    assert _ask(client).choices[0].message.content == "ok"
+
+
+def test_only_one_request_probes_while_others_are_answered(tmp_path, monkeypatch):
+    QUOTA.record("gemini-3.8-flash-low", QUOTA_LINE)
+    real_time = time.time
+    monkeypatch.setattr(time, "time", lambda: real_time() + 901)
+    assert QUOTA.check("gemini-3.8-flash-low") is True  # this one probes
+    with pytest.raises(AGYQuotaError):
+        QUOTA.check("gemini-3.8-flash-low")  # the next is answered from the record
+
+
+def test_remembering_can_be_turned_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_AGY_QUOTA_STATE", "off")
+    stub, calls = _counting_stub(tmp_path, "quota")
+    client = AGYClient(
+        command=str(stub), cwd=str(tmp_path), timeout=30, terminate_grace=0.2
+    )
+    for _ in range(2):
+        with pytest.raises(AGYQuotaError):
+            _ask(client)
+    assert calls.read_text() == "2"
+
+
+def test_quota_cli_shows_and_clears(capsys):
+    from agybridge.cli import main
+
+    QUOTA.record("gemini-3.8-flash-low", QUOTA_LINE)
+    main(["quota"])
+    assert "gemini-3.8-flash: spent, resets in 94h" in capsys.readouterr().out
+    main(["quota", "--clear"])
+    assert QUOTA.entries() == {}

@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Sequence
 
 
@@ -41,6 +42,29 @@ def _cmd_orca_install(args: argparse.Namespace) -> None:
         print(f"[dry-run] Would create Orca launcher at: {path}")
     else:
         print(f"Installed Orca launcher at: {path}")
+
+
+def _cmd_quota(args: argparse.Namespace) -> None:
+    from .quota import QUOTA, format_duration, state_path
+
+    if args.clear:
+        QUOTA.clear()
+        print("Forgot every remembered AGY quota.")
+        return
+    entries = QUOTA.entries()
+    if not entries:
+        print(
+            f"No spent AGY quota remembered ({state_path() or 'remembering is off'})."
+        )
+        return
+    now = time.time()
+    for model, entry in sorted(entries.items()):
+        until = float(entry.get("until", 0))
+        probe = float(entry.get("probe_at", 0))
+        print(
+            f"{model}: spent, resets in {format_duration(until - now)}"
+            f" (next probe in {format_duration(probe - now)}): {entry.get('message', '')}"
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -79,6 +103,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--port", type=int, default=8792, help="Port for SSE transport (default: 8792)"
     )
     mcp_parser.set_defaults(func=_cmd_mcp)
+
+    # Subcommand: quota
+    quota_parser = subparsers.add_parser(
+        "quota", help="Show or forget remembered spent AGY quotas"
+    )
+    quota_parser.add_argument(
+        "--clear", action="store_true", help="Forget every remembered quota"
+    )
+    quota_parser.set_defaults(func=_cmd_quota)
 
     # Subcommand: config
     config_parser = subparsers.add_parser(

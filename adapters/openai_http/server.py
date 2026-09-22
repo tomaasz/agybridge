@@ -44,11 +44,18 @@ class OpenAIHTTPHandler(BaseHTTPRequestHandler):
     def agy_client(self) -> AGYClient:
         return self.server.client
 
-    def _send_json(self, status: int, data: dict[str, Any]) -> None:
+    def _send_json(
+        self,
+        status: int,
+        data: dict[str, Any],
+        headers: dict[str, str] | None = None,
+    ) -> None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -58,6 +65,7 @@ class OpenAIHTTPHandler(BaseHTTPRequestHandler):
         message: str,
         error_type: str = "invalid_request_error",
         code: str | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         payload = {
             "error": {
@@ -67,7 +75,7 @@ class OpenAIHTTPHandler(BaseHTTPRequestHandler):
         }
         if code:
             payload["error"]["code"] = code
-        self._send_json(status, payload)
+        self._send_json(status, payload, headers)
 
     def _check_auth(self) -> bool:
         required_token = self.server_token
@@ -187,8 +195,17 @@ class OpenAIHTTPHandler(BaseHTTPRequestHandler):
             return
         except AGYQuotaError as exc:
             # 429 lets OpenAI-compatible clients fall back to another provider.
+            retry = (
+                {"Retry-After": str(max(1, int(exc.retry_after)))}
+                if exc.retry_after
+                else None
+            )
             self._send_error(
-                429, str(exc), error_type="rate_limit_error", code="insufficient_quota"
+                429,
+                str(exc),
+                error_type="rate_limit_error",
+                code="insufficient_quota",
+                headers=retry,
             )
             return
         except (AGYProcessError, AGYProtocolError) as exc:

@@ -20,7 +20,22 @@ class AGYProcessError(AGYError):
 
 
 class AGYQuotaError(AGYProcessError):
-    """AGY's account quota is exhausted; retrying before it resets is pointless."""
+    """AGY's account quota is exhausted; retrying before it resets is pointless.
+
+    ``quota_message`` is AGY's own text (with the reset time); ``retry_after``
+    is the number of seconds until the reset, when known.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        quota_message: str | None = None,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.quota_message = quota_message
+        self.retry_after = retry_after
 
 
 class AGYProtocolError(AGYError):
@@ -151,7 +166,7 @@ def _parse_stream_json(stdout: bytes) -> ParsedOutput:
         detail = _redact(error).strip() if isinstance(error, str) else ""
         quota = quota_message(detail)
         if quota:
-            raise AGYQuotaError(f"AGY quota exhausted: {quota}")
+            raise AGYQuotaError(f"AGY quota exhausted: {quota}", quota_message=quota)
         raise AGYProcessError(
             f"AGY run failed: {detail}" if detail else "AGY run failed"
         )

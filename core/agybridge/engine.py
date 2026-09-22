@@ -36,6 +36,7 @@ from .protocol import (
     AGYTimeoutError,
     ParsedOutput,
 )
+from .quota import QUOTA
 from .security import (
     DEFAULT_MAX_ARGUMENT_BYTES,
     DEFAULT_MAX_PROMPT_BYTES,
@@ -96,7 +97,7 @@ def _quota_error(message: str) -> AGYQuotaError:
         "AGY quota exhausted (%s); stopping AGY instead of waiting out its retries",
         message,
     )
-    return AGYQuotaError(f"AGY quota exhausted: {message}")
+    return AGYQuotaError(f"AGY quota exhausted: {message}", quota_message=message)
 
 
 def _route(session: AGYSession | None, disposable: bool) -> str:
@@ -536,7 +537,21 @@ class AGYClient:
             raise AGYProtocolError("AGY returned an empty response")
         return tool_calls, clean_text
 
-    def _create(
+    def _create(self, *, model: str | None = None, **call: Any) -> Any:
+        # A remembered spent quota answers at once instead of launching AGY.
+        quota_model = (model or self.default_model).strip()
+        probing = QUOTA.check(quota_model) if quota_model else False
+        try:
+            result = self._create_unchecked(model=model, **call)
+        except AGYQuotaError as exc:
+            exc.retry_after = QUOTA.record(quota_model, exc.quota_message or str(exc))
+            raise
+        if probing:
+            QUOTA.clear(quota_model)
+            logger.info("AGY quota for %s is available again", quota_model)
+        return result
+
+    def _create_unchecked(
         self,
         *,
         model: str | None = None,
