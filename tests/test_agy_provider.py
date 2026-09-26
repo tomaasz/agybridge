@@ -218,6 +218,22 @@ def test_provider_exposes_high_and_fast_profiles(monkeypatch):
     assert module.agy.aliases == ("antigravity",)
 
 
+def test_every_plugin_import_registers_both_profiles(monkeypatch):
+    # Hermes imports the plugin once per profile home in one process; a cached
+    # ``adapters.hermes`` import must not leave the second home without providers.
+    _load_plugin(monkeypatch)
+    registered = []
+    monkeypatch.setattr(sys.modules["providers"], "register_provider", registered.append)
+    name = f"agy_provider_test_{next(_IDS)}"
+    spec = importlib.util.spec_from_file_location(
+        name, PLUGIN, submodule_search_locations=[str(PLUGIN.parent)]
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    assert [p.name for p in registered] == ["agy", "agy-fast"]
+
+
 def test_forwards_model_effort_read_only_and_schema(monkeypatch, tmp_path):
     module = _load_plugin(monkeypatch)
     capture = tmp_path / "argv.json"

@@ -27,6 +27,16 @@ from adapters.hermes import (
 
 from . import client, session
 
+# ``adapters.hermes`` registers both profiles as an import side effect, which runs once per
+# process. Hermes imports this plugin once per HERMES_HOME (each profile gets its own provider
+# layer), so a second profile served by the same process (gateway cron, desktop backend) would
+# see a cached import and an empty layer: "Could not find the 'agy' CLI command '(none
+# configured)'". Registering here again lands in whichever home layer is importing us.
+from providers import register_provider as _register_provider
+
+_register_provider(agy)
+_register_provider(agy_fast)
+
 __all__ = [
     "CONTEXT_LENGTH",
     "FAST_MODEL",
