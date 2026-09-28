@@ -106,6 +106,7 @@ class AGYSession:
         max_stderr_bytes: int,
         terminate_grace: float,
         watcher: AGYLogWatcher | None = None,
+        max_stdout_bytes: int = 8 * 1024 * 1024,
     ) -> None:
         popen_kwargs: dict[str, Any] = {}
         if os.name == "posix":
@@ -130,6 +131,10 @@ class AGYSession:
         self.last_used = time.monotonic()
         self.terminate_grace = terminate_grace
         self._lines: queue.Queue[Any] = queue.Queue()
+        self._buffer_limit = max_stdout_bytes
+        self._buffered = 0
+        self._buffer_lock = threading.Lock()
+        self._overflow = threading.Event()
         self._stderr = bytearray()
         self._max_stderr_bytes = max_stderr_bytes
         self._err_thread = threading.Thread(target=self._drain_stderr, daemon=True)
@@ -138,9 +143,15 @@ class AGYSession:
 
     def _read_stdout(self) -> None:
         with contextlib.suppress(OSError, ValueError):
-            for line in iter(self.process.stdout.readline, b""):
+            for line in iter(lambda: self.process.stdout.readline(self._buffer_limit + 1), b""):
+                with self._buffer_lock:
+                    if len(line) + self._buffered > self._buffer_limit:
+                        self._overflow.set()
+                        return
                 if line.strip():
                     self._note_conversation(line)
+                    with self._buffer_lock:
+                        self._buffered += len(line)
                     self._lines.put(line)
         self._lines.put(_EOF)
 
@@ -175,7 +186,9 @@ class AGYSession:
             self.process.poll(), self._stderr.decode("utf-8", errors="replace")
         )
 
-    def run_turn(self, content: str, timeout: float, max_stdout_bytes: int) -> bytes:
+    def run_turn(self, content: str, timeout: float, max_stdout_bytes: int,
+                 on_stdout_line: Callable[[bytes], None] | None = None,
+                 abort: Callable[[], BaseException | None] | None = None) -> bytes:
         """Send one user message and return the stdout lines of its turn."""
         deadline = time.monotonic() + timeout
         if not self.alive:
@@ -197,7 +210,12 @@ class AGYSession:
 
         writer = threading.Thread(target=write, daemon=True)
         writer.start()
-        writer.join(max(0.0, deadline - time.monotonic()))
+        while writer.is_alive() and time.monotonic() < deadline:
+            if abort is not None:
+                error = abort()
+                if error is not None:
+                    raise error
+            writer.join(min(0.1, max(0.0, deadline - time.monotonic())))
         if writer.is_alive():
             raise SessionTimeout()
         if write_errors:
@@ -206,6 +224,12 @@ class AGYSession:
         collected: list[bytes] = []
         size = 0
         while True:
+            if self._overflow.is_set():
+                raise SessionOverflow()
+            if abort is not None:
+                error = abort()
+                if error is not None:
+                    raise error
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise SessionTimeout()
@@ -219,10 +243,14 @@ class AGYSession:
                 continue
             if line is _EOF:
                 raise self._died()
+            with self._buffer_lock:
+                self._buffered -= len(line)
             size += len(line)
             if size > max_stdout_bytes:
                 raise SessionOverflow()
             collected.append(line)
+            if on_stdout_line is not None:
+                on_stdout_line(line)
             if _ends_turn(line):
                 break
         self.turns += 1
@@ -231,8 +259,6 @@ class AGYSession:
 
     def stop(self) -> None:
         """Kill the process group; safe to call more than once."""
-        with contextlib.suppress(OSError, ValueError):
-            self.process.stdin.close()
         if self.process.poll() is None:
             try:
                 if os.name == "posix":
@@ -248,6 +274,9 @@ class AGYSession:
                         self.process.kill()
         with contextlib.suppress(Exception):
             self.process.wait(timeout=self.terminate_grace)
+        # Closing a pipe first can deadlock on the writer thread's buffer lock.
+        with contextlib.suppress(OSError, ValueError):
+            self.process.stdin.close()
         if self.watcher is not None:
             self.watcher.close()
 

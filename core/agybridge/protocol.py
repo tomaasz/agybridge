@@ -19,6 +19,10 @@ class AGYProcessError(AGYError):
     """The external process could not produce a successful response."""
 
 
+class AGYBusyError(AGYProcessError):
+    """A concurrent request already owns this conversation."""
+
+
 class AGYQuotaError(AGYProcessError):
     """AGY's account quota is exhausted; retrying before it resets is pointless.
 

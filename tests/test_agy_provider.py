@@ -500,9 +500,9 @@ def test_partial_ndjson_stream_true_usage_and_unicode(monkeypatch, tmp_path):
             }
         ],
     )
-    chunks = _client(module, tmp_path, stub).chat.completions.create(
+    chunks = list(_client(module, tmp_path, stub).chat.completions.create(
         messages=[], stream=True
-    )
+    ))
     assert len(chunks) == 2 and chunks[-1].usage.total_tokens == 19
 
 
@@ -1157,11 +1157,13 @@ def test_denied_action_retry_is_logged_with_the_action_name(
     )
 
 
-def test_persistent_mode_is_opt_in_and_idle_sessions_expire(
+def test_hermes_persistent_default_can_be_disabled_and_idle_sessions_expire(
     monkeypatch, tmp_path, request
 ):
     module = _load_plugin(monkeypatch)
     monkeypatch.delenv("HERMES_AGY_PERSISTENT", raising=False)
+    assert module.AGYClient(cwd=str(tmp_path)).persistent is True
+    monkeypatch.setenv("HERMES_AGY_PERSISTENT", "0")
     assert module.AGYClient(cwd=str(tmp_path)).persistent is False
     monkeypatch.setenv("HERMES_AGY_PERSISTENT", "1")
     assert module.AGYClient(cwd=str(tmp_path)).persistent is True
@@ -1178,6 +1180,23 @@ def test_persistent_mode_is_opt_in_and_idle_sessions_expire(
     ]
     client.chat.completions.create(messages=history)
     assert _spawn_count(spawns) == 2
+
+
+def test_tool_auxiliary_context_reuses_process_and_sends_delta(monkeypatch, tmp_path, request):
+    module = _load_plugin(monkeypatch)
+    monkeypatch.delenv("HERMES_AGY_PERSISTENT", raising=False)
+    portal = types.ModuleType("agent.portal_tags")
+    portal.get_conversation_context = lambda: "cron-run-123"
+    monkeypatch.setitem(sys.modules, "agent.portal_tags", portal)
+    stub, log, spawns = _session_stub(tmp_path, ["first", "second"])
+    request.addfinalizer(module.client.POOL.clear)
+    client = _client(module, tmp_path, stub)
+    history = [{"role":"user", "content":"task"}]
+    client.chat.completions.create(messages=history, tools=[_tool()])
+    history += [{"role":"assistant", "content":"first"}, {"role":"user", "content":"continue"}]
+    client.chat.completions.create(messages=history, tools=[_tool()])
+    assert _spawn_count(spawns) == 1
+    assert _turns(log)[1]["content"].startswith("HERMES_CONVERSATION_DELTA_JSON")
 
 
 def test_persistent_mode_needs_a_session_id_and_keeps_one_process_per_session(

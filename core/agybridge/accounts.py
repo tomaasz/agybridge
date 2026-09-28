@@ -116,6 +116,9 @@ class AccountPool:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._next_check = 0.0
+        self._refreshing = False
+        self._pending: tuple[Any, dict[str, Any]] | None = None
+        self._generation = 0
 
     def current(self) -> dict[str, str] | None:
         """The pool account AGY is set up with ({"id", "email"}), if any."""
@@ -212,12 +215,46 @@ class AccountPool:
         settings = pool_settings()
         if settings is None:
             return False
-        with self._lock:
+        # When an account exists, a slow refresh/rotation must not stop all
+        # requests. First bootstrap is synchronous because no credential exists.
+        current = self.current()
+        if not self._lock.acquire(blocking=current is None):
+            return False
+        try:
+            identity = (settings, str(state_file()))
+            changed = False
+            if self._pending is not None:
+                pending_identity, reply = self._pending
+                self._pending = None
+                if pending_identity == identity:
+                    changed = self._apply_safely(reply)
             now = time.monotonic()
-            if now < self._next_check:
-                return False
+            if now < self._next_check or self._refreshing:
+                return changed
             current = self.current()
             path = "/agy/credential" + (f"?current={current['id']}" if current else "")
+            if current is not None:
+                self._refreshing = True
+                generation = self._generation
+
+                def refresh() -> None:
+                    status, reply = 503, {}
+                    try:
+                        status, reply = self._request(settings, "GET", path)
+                    except (OSError, ValueError):
+                        status, reply = 503, {}
+                    finally:
+                        # Installation happens at the next request boundary,
+                        # never halfway through a background network operation.
+                        with self._lock:
+                            self._refreshing = False
+                            if generation == self._generation:
+                                self._next_check = time.monotonic() + (REFRESH_SECONDS if status == 200 else RETRY_AFTER_FAILURE_SECONDS)
+                                if status == 200:
+                                    self._pending = (identity, reply)
+
+                threading.Thread(target=refresh, name="agy-account-refresh", daemon=True).start()
+                return changed
             try:
                 status, reply = self._request(settings, "GET", path)
             except (OSError, ValueError) as exc:
@@ -238,6 +275,8 @@ class AccountPool:
                 return False
             self._next_check = now + REFRESH_SECONDS
             return self._apply_safely(reply)
+        finally:
+            self._lock.release()
 
     def report_quota(self, message: str, retry_after: float | None) -> bool:
         """Tell agent-lb the current account is spent; True if another one was installed."""
@@ -251,6 +290,9 @@ class AccountPool:
             "resetSeconds": retry_after,
         }
         with self._lock:
+            # Discard refresh results that predate an explicit quota rotation.
+            self._generation += 1
+            self._pending = None
             try:
                 status, reply = self._request(settings, "POST", "/agy/quota", body)
             except (OSError, ValueError) as exc:

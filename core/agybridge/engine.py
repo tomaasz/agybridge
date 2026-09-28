@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from .accounts import ACCOUNTS
+from .admission import ADMISSION
 from .agylog import AGYLogWatcher, new_log_path
 from .backends.agy import AGY_EFFORTS, DEFAULT_BACKEND, agy_effort
 from .backends.base import CliBackend
@@ -64,6 +65,7 @@ from .session import (
     warm_spare_enabled,
 )
 from .toolcalls import _TOOL_OPEN, _strict_tool_calls, _tool_policy
+from .streaming import STATE
 
 SESSION_ID_FIELD = "hermes_session_id"
 # Pool accounts tried after the first one within a single request.
@@ -89,6 +91,11 @@ def _process_cwd() -> Path:
 
 
 def _log_denied_retry(parsed: ParsedOutput) -> None:
+    state = STATE.get()
+    if state is not None and state.text:
+        raise AGYProtocolError("AGY denied an action after streaming text; retry is unsafe")
+    if os.environ.get("HERMES_AGY_DENIED_RETRY", "1").lower() in {"0", "off", "false", "no"}:
+        raise AGYProcessError("AGY attempted an internal action; retry disabled")
     logger.info(
         "AGY tried its own action (%s); retrying once with the Hermes tool contract",
         ", ".join(parsed.denied_names) or "unnamed",
@@ -231,6 +238,7 @@ class AGYClient:
         self, model: str, effort: str, prompt: str, effective_timeout: float
     ) -> ParsedOutput:
         request_deadline = time.monotonic() + effective_timeout
+        state = STATE.get()
         current_prompt = prompt
         for attempt in range(2):
             remaining = request_deadline - time.monotonic()
@@ -252,6 +260,8 @@ class AGYClient:
             def quota_abort(
                 watcher: AGYLogWatcher | None = watcher,
             ) -> AGYQuotaError | None:
+                if state is not None and state.abort() is not None:
+                    return state.abort()
                 message = watcher.check() if watcher is not None else None
                 return _quota_error(message) if message else None
 
@@ -278,6 +288,7 @@ class AGYClient:
                     on_process_start=on_start,
                     on_process_done=on_done,
                     abort=quota_abort,
+                    on_stdout_line=state.line if state is not None else None,
                 )
             finally:
                 if watcher is not None:
@@ -421,8 +432,16 @@ class AGYClient:
         """A pre-started process for these launch settings; primes the next one."""
         if not warm_spare_enabled():
             return None
+        launch = self._spare_key(model, effort, account)
+        spare = POOL.take_spare(launch)
+        POOL.prime(launch, lambda: self._spawn(launch, model, effort, None))
+        if spare is not None:
+            spare.from_spare = True
+        return spare
+
+    def _spare_key(self, model: str, effort: str, account: str) -> tuple[Any, ...]:
         # Launch settings only: the process takes its prompt later over stdin.
-        launch = (
+        return (
             self.command,
             self.cwd,
             tuple(sorted(self._child_env.items())),
@@ -430,11 +449,23 @@ class AGYClient:
             effort,
             *((account,) if account else ()),
         )
-        spare = POOL.take_spare(launch)
-        POOL.prime(launch, lambda: self._spawn(launch, model, effort, None))
-        if spare is not None:
-            spare.from_spare = True
-        return spare
+
+    def prewarm(self) -> None:
+        """Prepare the default model at host startup without consuming a turn."""
+        if not warm_spare_enabled() or self.is_closed:
+            return
+
+        def prepare() -> None:
+            if ACCOUNTS.ensure():
+                POOL.clear()
+            if self.is_closed:
+                return
+            account = ACCOUNTS.current_id()
+            model, effort = self.backend.map_model_and_effort(self.default_model, None, self.effort)
+            launch = self._spare_key(model, effort, account)
+            POOL.prime(launch, lambda: self._spawn(launch, model, effort, None))
+
+        threading.Thread(target=prepare, name="agy-prewarm", daemon=True).start()
 
     def _spawn(
         self,
@@ -461,6 +492,7 @@ class AGYClient:
                 max_stderr_bytes=self.max_stderr_bytes,
                 terminate_grace=self.terminate_grace,
                 watcher=AGYLogWatcher(log_path) if log_path is not None else None,
+                max_stdout_bytes=self.max_stdout_bytes,
             )
         except FileNotFoundError as exc:
             raise AGYProcessError(
@@ -494,7 +526,12 @@ class AGYClient:
                         f"AGY exceeded the {effective_timeout:g}s request timeout"
                     )
                 try:
-                    stdout = session.run_turn(content, remaining, self.max_stdout_bytes)
+                    state = STATE.get()
+                    stdout = session.run_turn(
+                        content, remaining, self.max_stdout_bytes,
+                        on_stdout_line=state.line if state is not None else None,
+                        abort=state.abort if state is not None else None,
+                    )
                 except SessionTimeout as exc:
                     raise AGYTimeoutError(
                         f"AGY exceeded the {effective_timeout:g}s request timeout"
@@ -550,8 +587,28 @@ class AGYClient:
         return tool_calls, clean_text
 
     def _create(self, *, model: str | None = None, **call: Any) -> Any:
+        if call.get("stream"):
+            from .streaming import CompletionStream
+
+            return CompletionStream(self, model, call)
+        timeout = _positive_number(call.get("timeout"), self.timeout, label="AGY request timeout")
+        deadline = time.monotonic() + timeout
+        extra = call.get("extra_body")
+        session_id = extra.get(SESSION_ID_FIELD) if isinstance(extra, Mapping) else None
+        key = None
+        if isinstance(session_id, str) and session_id.strip():
+            mapped = self.backend.map_model_and_effort(model or self.default_model, agy_effort(call.get("reasoning_effort")), self.effort)
+            schemas = hashlib.sha256(json.dumps([call.get("tools"), call.get("tool_choice")], sort_keys=True).encode()).hexdigest()
+            key = (self.command, self.cwd, session_id.strip(), *mapped, schemas)
+        with ADMISSION.enter(key, deadline):
+            return self._create_admitted(model=model, deadline=deadline, call=call)
+
+    def _create_admitted(self, *, model: str | None, deadline: float, call: dict[str, Any]) -> Any:
         quota_model = (model or self.default_model).strip()
         for attempt in range(MAX_ACCOUNT_SWITCHES + 1):
+            state = STATE.get()
+            if state is not None and state.abort() is not None:
+                raise state.abort()
             # The agent-lb pool decides the Google account; a new one makes
             # the idle sessions of the old one useless.
             if ACCOUNTS.ensure():
@@ -560,8 +617,14 @@ class AGYClient:
             try:
                 # A remembered spent quota answers at once instead of launching AGY.
                 probing = QUOTA.check(quota_model, account) if quota_model else False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AGYTimeoutError("AGY request deadline exceeded")
+                call["timeout"] = remaining
                 result = self._create_unchecked(model=model, account=account, **call)
             except AGYQuotaError as exc:
+                if state is not None and state.text:
+                    raise
                 message = exc.quota_message or str(exc)
                 if not exc.remembered:
                     exc.retry_after = QUOTA.record(quota_model, message, account)
@@ -641,6 +704,10 @@ class AGYClient:
             # A one-shot request may run in a warm spare, which is discarded
             # afterwards so nothing carries over between unrelated requests.
             session = self._take_spare(agy_model, effort, account)
+            if session is None and warm_spare_enabled():
+                # Cold one-shot requests can also repair/handle a denial in the
+                # same process instead of launching again with the whole prompt.
+                session = self._spawn((), agy_model, effort, None)
             disposable = session is not None
             if session is None:
                 parsed = self._oneshot_turn(
@@ -655,7 +722,8 @@ class AGYClient:
             try:
                 tool_calls, clean_text = self._validate_reply(parsed, policy)
             except AGYProtocolError as exc:
-                if session is None:
+                state = STATE.get()
+                if session is None or (state is not None and state.text):
                     raise
                 # A live session keeps the conversation, so asking AGY to fix its
                 # reply costs one short turn instead of a cold full-prompt retry.
@@ -670,6 +738,9 @@ class AGYClient:
                 )
                 tool_calls, clean_text = self._validate_reply(parsed, policy)
                 repaired = True
+            state = STATE.get()
+            if state is not None:
+                state.finish(clean_text)
         except BaseException:
             if session is not None:
                 session.stop()

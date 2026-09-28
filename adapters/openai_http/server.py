@@ -9,16 +9,20 @@ import os
 import secrets
 import time
 import uuid
+import itertools
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from agybridge.engine import SESSION_ID_FIELD, AGYClient
 from agybridge.protocol import (
+    AGYBusyError,
     AGYProcessError,
     AGYProtocolError,
     AGYQuotaError,
     AGYTimeoutError,
 )
+from agybridge.ports import default_completion_to_stream_chunks
 
 from .bridge import HTTP_PORTS, format_chat_completion_chunk, serialize_chat_completion
 
@@ -27,11 +31,43 @@ logger = logging.getLogger(__name__)
 MAX_PAYLOAD_BYTES = 8 * 1024 * 1024  # 8 MiB strict limit
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """Bound slow clients as well as requests waiting for AGY capacity."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._connections = threading.BoundedSemaphore(32)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._connections.acquire(blocking=False):
+            try:
+                request.settimeout(1.0)
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\nRetry-After: 1\r\n\r\n")
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._connections.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connections.release()
+
+
 class OpenAIHTTPHandler(BaseHTTPRequestHandler):
     """HTTP Request handler implementing OpenAI-compatible completions and models."""
 
     # Protocol version
     protocol_version = "HTTP/1.1"
+
+    def setup(self) -> None:
+        self.request.settimeout(15.0)
+        super().setup()
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -67,6 +103,7 @@ class OpenAIHTTPHandler(BaseHTTPRequestHandler):
         code: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
+        self.close_connection = True
         payload = {
             "error": {
                 "message": message,
@@ -144,6 +181,10 @@ class OpenAIHTTPHandler(BaseHTTPRequestHandler):
             self._send_error(400, "Invalid Content-Length", code="bad_request")
             return
 
+        if content_length < 0 or self.headers.get("Transfer-Encoding"):
+            self._send_error(400, "Invalid request framing", code="bad_request")
+            return
+
         if content_length > MAX_PAYLOAD_BYTES:
             self._send_error(
                 413,
@@ -152,7 +193,11 @@ class OpenAIHTTPHandler(BaseHTTPRequestHandler):
             )
             return
 
-        body_bytes = self.rfile.read(content_length)
+        try:
+            body_bytes = self.rfile.read(content_length)
+        except TimeoutError:
+            self._send_error(408, "Request body timed out", code="request_timeout")
+            return
         if len(body_bytes) != content_length:
             self._send_error(400, "Incomplete body read", code="bad_request")
             return
@@ -186,10 +231,18 @@ class OpenAIHTTPHandler(BaseHTTPRequestHandler):
                 messages=messages,
                 tools=tools,
                 tool_choice=tool_choice,
-                stream=False,  # We fetch the completion object first
+                stream=stream,
                 reasoning_effort=reasoning_effort,
                 extra_body=extra_body,
             )
+            if stream:
+                self._send_stream(completion, model)
+                return
+        except AGYBusyError as exc:
+            self._send_error(503, str(exc), code="overloaded", headers={"Retry-After": "1"})
+            return
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except AGYTimeoutError as exc:
             self._send_error(504, str(exc), error_type="timeout_error", code="timeout")
             return
@@ -224,55 +277,60 @@ class OpenAIHTTPHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if not stream:
-            response_dict = serialize_chat_completion(completion)
-            self._send_json(200, response_dict)
-            return
+        response_dict = serialize_chat_completion(completion)
+        self._send_json(200, response_dict)
 
-        # Streaming response
-        self.close_connection = True
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.end_headers()
-
+    def _send_stream(self, completion: Any, model: str) -> None:
+        stream = completion if not hasattr(completion, "choices") else default_completion_to_stream_chunks(completion)
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
-        choice = completion.choices[0]
-        msg = choice.message
-
-        # First chunk: role
-        self.wfile.write(format_chat_completion_chunk(chunk_id, model).encode("utf-8"))
-        self.wfile.flush()
-
-        # Content or tool calls delta
-        if msg.content or msg.tool_calls:
-            self.wfile.write(
-                format_chat_completion_chunk(
-                    chunk_id,
-                    model,
-                    delta_content=msg.content or None,
-                    delta_tool_calls=msg.tool_calls or None,
-                ).encode("utf-8")
-            )
+        started = False
+        try:
+            iterator = iter(stream)
+            # Preserve HTTP errors for preflight failures, including quota and
+            # overload. A live stream yields a heartbeat within one second.
+            first = next(iterator)
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            started = True
+            for chunk in itertools.chain([first], iterator):
+                usage = getattr(chunk, "usage", None)
+                usage_dict = {name: getattr(usage, name, 0) for name in ("prompt_tokens", "completion_tokens", "total_tokens")} if usage is not None else None
+                if chunk.choices:
+                    choice = chunk.choices[0]
+                    data = format_chat_completion_chunk(
+                        chunk_id, model,
+                        delta_content=getattr(choice.delta, "content", None),
+                        delta_tool_calls=getattr(choice.delta, "tool_calls", None),
+                        finish_reason=choice.finish_reason, usage=usage_dict,
+                    )
+                elif usage_dict is not None:
+                    data = "data: " + json.dumps({"id": chunk_id, "object": "chat.completion.chunk", "model": model, "choices": [], "usage": usage_dict}) + "\n\n"
+                else:
+                    data = ": keep-alive\n\n"
+                self.wfile.write(data.encode("utf-8"))
+                self.wfile.flush()
+            self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
-
-        # Finish reason and usage chunk
-        usage_dict = {
-            "prompt_tokens": getattr(completion.usage, "prompt_tokens", 0),
-            "completion_tokens": getattr(completion.usage, "completion_tokens", 0),
-            "total_tokens": getattr(completion.usage, "total_tokens", 0),
-        }
-        self.wfile.write(
-            format_chat_completion_chunk(
-                chunk_id,
-                model,
-                finish_reason=choice.finish_reason,
-                usage=usage_dict,
-            ).encode("utf-8")
-        )
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as exc:
+            if not started:
+                raise
+            if isinstance(exc, TimeoutError) and not isinstance(exc, AGYTimeoutError):
+                return
+            # HTTP status is committed; terminate with an explicit stream error.
+            payload = {"error": {"message": str(exc), "type": "api_error"}}
+            self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
+            self.wfile.flush()
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
 
     def log_message(self, format: str, *args: Any) -> None:
         logger.debug(
@@ -300,9 +358,10 @@ def create_server(
         token = os.environ.get("AGYBRIDGE_TOKEN") or os.environ.get("OPENAI_API_KEY")
 
     if client is None:
-        client = AGYClient(ports=HTTP_PORTS)
+        client = AGYClient(ports=HTTP_PORTS, persistent=True)
+        client.prewarm()
 
-    server = ThreadingHTTPServer((host, port), OpenAIHTTPHandler)
+    server = BoundedHTTPServer((host, port), OpenAIHTTPHandler)
     server.token = token  # type: ignore[attr-defined]
     server.client = client  # type: ignore[attr-defined]
     return server
@@ -330,6 +389,7 @@ def run_server(
         logger.info("Stopping agybridge HTTP server")
     finally:
         server.server_close()
+        server.client.close()
 
 
 def main() -> None:

@@ -54,6 +54,7 @@ def run_process(
     on_process_start: Callable[[subprocess.Popen[bytes]], None] | None = None,
     on_process_done: Callable[[subprocess.Popen[bytes]], None] | None = None,
     abort: Callable[[], BaseException | None] | None = None,
+    on_stdout_line: Callable[[bytes], None] | None = None,
 ) -> tuple[bytes, bytes]:
     """Execute a subprocess with bounded stream readers and strict deadline.
 
@@ -94,13 +95,20 @@ def run_process(
     try:
         stdout, stderr = bytearray(), bytearray()
         overflow = threading.Event()
+        reader_errors: list[BaseException] = []
 
         def drain(
             stream: Any, target: bytearray, limit: int, *, keep_tail: bool
         ) -> None:
+            pending = bytearray()
             while True:
-                chunk = stream.read(65536)
+                chunk = stream.read1(65536)
                 if not chunk:
+                    if pending and on_stdout_line is not None and not keep_tail:
+                        try:
+                            on_stdout_line(bytes(pending))
+                        except BaseException as exc:
+                            reader_errors.append(exc)
                     return
                 if keep_tail:
                     target.extend(chunk)
@@ -113,6 +121,16 @@ def run_process(
                         overflow.set()
                         return
                     target.extend(chunk)
+                    if on_stdout_line is not None:
+                        pending.extend(chunk)
+                        while b"\n" in pending:
+                            line, _, rest = pending.partition(b"\n")
+                            pending = bytearray(rest)
+                            try:
+                                on_stdout_line(bytes(line))
+                            except BaseException as exc:
+                                reader_errors.append(exc)
+                                return
 
         out_thread = threading.Thread(
             target=drain,
@@ -143,6 +161,9 @@ def run_process(
         timed_out = False
         aborted: BaseException | None = None
         while process.poll() is None:
+            if reader_errors:
+                stop_process(process, terminate_grace)
+                break
             if overflow.is_set():
                 stop_process(process, terminate_grace)
                 break
@@ -160,6 +181,8 @@ def run_process(
         out_thread.join(timeout=terminate_grace)
         err_thread.join(timeout=terminate_grace)
 
+        if reader_errors:
+            raise reader_errors[0]
         if aborted is not None:
             raise aborted
         if timed_out:
