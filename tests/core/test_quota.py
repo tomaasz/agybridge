@@ -34,6 +34,8 @@ def _log_dir(monkeypatch, tmp_path):
     monkeypatch.setenv(agylog.LOG_DIR_ENV, str(tmp_path / "agy-logs"))
     monkeypatch.setenv("HERMES_AGY_SESSION_STORE", str(tmp_path / "store.json"))
     monkeypatch.setenv("HERMES_AGY_QUOTA_STATE", str(tmp_path / "agy-quota.json"))
+    monkeypatch.setenv("HERMES_AGY_WARM_SPARE", "0")
+    monkeypatch.setattr("agybridge.accounts.pool_settings", lambda: None)
 
 
 def _result(**result) -> bytes:
@@ -117,7 +119,7 @@ def _stub(tmp_path: Path, body: str) -> Path:
 def test_oneshot_stops_agy_as_soon_as_the_quota_is_logged(tmp_path):
     stub = _stub(
         tmp_path,
-        "sys.stdin.read()\n"
+        "sys.stdin.readline()\n"
         "print(json.dumps({'event': 'init', 'init': {}}), flush=True)\n"
         "quota()\n"
         "time.sleep(60)\n",
@@ -164,7 +166,7 @@ def test_agy_gets_a_private_log_file(tmp_path):
     script.write_text(
         f"#!{sys.executable}\nimport json, sys\n"
         f"open({str(capture)!r}, 'w').write(json.dumps(sys.argv[1:]))\n"
-        "sys.stdin.read()\n"
+        "sys.stdin.readline()\n"
         "print(json.dumps({'event': 'result', 'result': {'response': 'ok'}}), flush=True)\n",
         encoding="utf-8",
     )
@@ -192,7 +194,7 @@ def _counting_stub(tmp_path: Path, reply: str) -> tuple[Path, Path]:
         f"#!{sys.executable}\nimport json, pathlib, sys, time\n"
         f"p = pathlib.Path({str(calls)!r}); p.write_text(str(int(p.read_text()) + 1 if p.exists() else 1))\n"
         "log = sys.argv[sys.argv.index('--log-file') + 1]\n"
-        "sys.stdin.read()\n"
+        "sys.stdin.readline()\n"
         f"if {reply!r} == 'quota':\n"
         f"    open(log, 'a').write({QUOTA_LINE!r} + '\\n'); time.sleep(60)\n"
         "print(json.dumps({'event': 'result', 'result': {'response': 'ok'}}), flush=True)\n",

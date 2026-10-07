@@ -99,7 +99,7 @@ def _agy_stub(tmp_path: Path) -> Path:
     script.write_text(
         f"#!{sys.executable}\nimport json, sys, time\n"
         "log = sys.argv[sys.argv.index('--log-file') + 1]\n"
-        "sys.stdin.read()\n"
+        "sys.stdin.readline()\n"
         f"who = json.load(open({token!r}))['token']['refresh_token'].removeprefix('refresh-')\n"
         "if who == 'a':\n"
         f"    open(log, 'a').write({QUOTA_LINE!r} + '\\n'); time.sleep(60)\n"

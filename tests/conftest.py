@@ -29,3 +29,4 @@ def _agy_logs_in_tmp(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("HERMES_AGY_ACCOUNT_STATE", str(isolated / "account.json"))
     monkeypatch.delenv("AGENT_LB_URL", raising=False)
     monkeypatch.delenv("AGENT_LB_API_KEY", raising=False)
+    monkeypatch.setenv("HERMES_AGY_WARM_SPARE", "0")
