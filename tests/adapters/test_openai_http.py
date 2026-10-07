@@ -1,17 +1,17 @@
 from __future__ import annotations
 
+import http.client
 import json
 import socket
-import http.client
 import threading
 import urllib.error
 import urllib.request
 from types import SimpleNamespace
 
 import pytest
+from agybridge.protocol import AGYBusyError, AGYTimeoutError
 
 from adapters.openai_http.server import create_server
-from agybridge.protocol import AGYBusyError, AGYTimeoutError
 
 
 def _find_free_port() -> int:
@@ -160,9 +160,14 @@ def test_negative_content_length_fails_without_waiting(http_server):
     base_url, client = http_server
     conn = http.client.HTTPConnection(base_url.removeprefix("http://"), timeout=2)
     try:
-        conn.request("POST", "/v1/chat/completions", headers={
-            "Authorization":"Bearer test-secret-token", "Content-Length":"-1"
-        })
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            headers={
+                "Authorization": "Bearer test-secret-token",
+                "Content-Length": "-1",
+            },
+        )
         response = conn.getresponse()
         assert response.status == 400
         response.read()
@@ -171,16 +176,25 @@ def test_negative_content_length_fails_without_waiting(http_server):
         conn.close()
 
 
-@pytest.mark.parametrize("error,status", [(AGYBusyError("busy"), 503), (AGYTimeoutError("timeout"), 504)])
+@pytest.mark.parametrize(
+    "error,status", [(AGYBusyError("busy"), 503), (AGYTimeoutError("timeout"), 504)]
+)
 def test_stream_preflight_errors_keep_http_status(http_server, error, status):
     base_url, client = http_server
+
     def fail(**kwargs):
         yield from ()
         raise error
+
     client.chat.completions.create = fail
-    req = urllib.request.Request(base_url+"/v1/chat/completions",
-        data=json.dumps({"messages":[], "stream":True}).encode(),
-        headers={"Authorization":"Bearer test-secret-token", "Content-Type":"application/json"})
+    req = urllib.request.Request(
+        base_url + "/v1/chat/completions",
+        data=json.dumps({"messages": [], "stream": True}).encode(),
+        headers={
+            "Authorization": "Bearer test-secret-token",
+            "Content-Type": "application/json",
+        },
+    )
     with pytest.raises(urllib.error.HTTPError) as info:
         urllib.request.urlopen(req, timeout=2)
     assert info.value.code == status
@@ -188,16 +202,24 @@ def test_stream_preflight_errors_keep_http_status(http_server, error, status):
 
 def test_sse_first_text_precedes_backend_completion(http_server):
     from agybridge.streaming import text_chunk
+
     base_url, client = http_server
     release = threading.Event()
+
     def generate(**kwargs):
         yield text_chunk("test", "first")
         assert release.wait(3)
         yield text_chunk("test", "second")
+
     client.chat.completions.create = generate
-    req = urllib.request.Request(base_url+"/v1/chat/completions",
-        data=json.dumps({"messages":[], "stream":True}).encode(),
-        headers={"Authorization":"Bearer test-secret-token", "Content-Type":"application/json"})
+    req = urllib.request.Request(
+        base_url + "/v1/chat/completions",
+        data=json.dumps({"messages": [], "stream": True}).encode(),
+        headers={
+            "Authorization": "Bearer test-secret-token",
+            "Content-Type": "application/json",
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=2) as response:
             assert b"first" in response.readline()

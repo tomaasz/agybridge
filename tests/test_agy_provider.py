@@ -223,7 +223,9 @@ def test_every_plugin_import_registers_both_profiles(monkeypatch):
     # ``adapters.hermes`` import must not leave the second home without providers.
     _load_plugin(monkeypatch)
     registered = []
-    monkeypatch.setattr(sys.modules["providers"], "register_provider", registered.append)
+    monkeypatch.setattr(
+        sys.modules["providers"], "register_provider", registered.append
+    )
     name = f"agy_provider_test_{next(_IDS)}"
     spec = importlib.util.spec_from_file_location(
         name, PLUGIN, submodule_search_locations=[str(PLUGIN.parent)]
@@ -500,9 +502,11 @@ def test_partial_ndjson_stream_true_usage_and_unicode(monkeypatch, tmp_path):
             }
         ],
     )
-    chunks = list(_client(module, tmp_path, stub).chat.completions.create(
-        messages=[], stream=True
-    ))
+    chunks = list(
+        _client(module, tmp_path, stub).chat.completions.create(
+            messages=[], stream=True
+        )
+    )
     assert len(chunks) == 2 and chunks[-1].usage.total_tokens == 19
 
 
@@ -1182,7 +1186,9 @@ def test_hermes_persistent_default_can_be_disabled_and_idle_sessions_expire(
     assert _spawn_count(spawns) == 2
 
 
-def test_tool_auxiliary_context_reuses_process_and_sends_delta(monkeypatch, tmp_path, request):
+def test_tool_auxiliary_context_reuses_process_and_sends_delta(
+    monkeypatch, tmp_path, request
+):
     module = _load_plugin(monkeypatch)
     monkeypatch.delenv("HERMES_AGY_PERSISTENT", raising=False)
     portal = types.ModuleType("agent.portal_tags")
@@ -1191,9 +1197,12 @@ def test_tool_auxiliary_context_reuses_process_and_sends_delta(monkeypatch, tmp_
     stub, log, spawns = _session_stub(tmp_path, ["first", "second"])
     request.addfinalizer(module.client.POOL.clear)
     client = _client(module, tmp_path, stub)
-    history = [{"role":"user", "content":"task"}]
+    history = [{"role": "user", "content": "task"}]
     client.chat.completions.create(messages=history, tools=[_tool()])
-    history += [{"role":"assistant", "content":"first"}, {"role":"user", "content":"continue"}]
+    history += [
+        {"role": "assistant", "content": "first"},
+        {"role": "user", "content": "continue"},
+    ]
     client.chat.completions.create(messages=history, tools=[_tool()])
     assert _spawn_count(spawns) == 1
     assert _turns(log)[1]["content"].startswith("HERMES_CONVERSATION_DELTA_JSON")

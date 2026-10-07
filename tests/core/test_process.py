@@ -29,7 +29,7 @@ def test_run_process_stdin_pipeline(tmp_path):
         "-c",
         "import sys; data = sys.stdin.read(); sys.stdout.write('echo:' + data)",
     ]
-    stdout, stderr = run_process(
+    stdout, _stderr = run_process(
         cmd,
         cwd=str(tmp_path),
         env=dict(os.environ),
