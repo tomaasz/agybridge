@@ -212,3 +212,44 @@ Verification covers:
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+<!-- VERIFIED-PROJECT-OVERVIEW:BEGIN -->
+## Opis projektu i technologii
+
+**Cel:** Łączenie AGY CLI z Hermesem i innymi narzędziami przez wtyczkę, HTTP, MCP lub interfejs terminalowy.
+
+**Sprawdzono:** 2026-10-11, na podstawie plików repozytorium z [commitu `7bd799eeee`](https://github.com/tomaasz/agybridge/commit/7bd799eeee3bba1d30c7e1056e182caa6aa38b0f).
+Opis plików nie potwierdza, że aplikacja jest wdrożona, działa bez błędów ani że wszystkie zadeklarowane narzędzia są używane.
+
+### Technologie i narzędzia
+
+- Główny język według GitHuba: **Python**.
+- Rozpoznane technologie w wybranych manifestach: Python, pytest.
+- Narzędzia zadeklarowane w wybranych plikach: Docker, GitHub Actions, Python CLI:agybridge, Python CLI:agybridge-mcp, Python CLI:agybridge-serve, container:python:3.11-slim, setuptools.
+
+### Wybrane pakiety
+
+| Pakiet | Wymaganie z manifestu | Plik |
+|---|---|---|
+| mcp | >=2.0.0 | pyproject.toml |
+| pytest | >=8.0.0 | pyproject.toml |
+| python | >=3.11 | pyproject.toml |
+| mcp | >=2.0.0 | packaging/pyproject.toml |
+| pytest | >=8.0.0 | packaging/pyproject.toml |
+| python | >=3.11 | packaging/pyproject.toml |
+
+To wybrane deklaracje, nie pełna lista i nie wynik pomiaru wersji uruchomionej aplikacji. Pełny wykaz zależności oraz lockfile, jeżeli istnieje, pozostają w repozytorium.
+
+### Skąd pochodzą informacje
+
+- [`README.md`](README.md).
+- [`pyproject.toml`](pyproject.toml).
+- [`packaging/pyproject.toml`](packaging/pyproject.toml).
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+- [`.github/workflows/test.yml`](.github/workflows/test.yml).
+- [`packaging/docker/Dockerfile`](packaging/docker/Dockerfile).
+
+### Zakres sprawdzenia
+
+Przegląd obejmuje wybrane pliki gałęzi domyślnej. Nie uruchamiano aplikacji ani nie zmieniano wdrożeń. Limity przeglądu mogą pomijać część modułów; brak pozycji w tym opisie nie dowodzi braku funkcji lub narzędzia.
+<!-- VERIFIED-PROJECT-OVERVIEW:END -->
